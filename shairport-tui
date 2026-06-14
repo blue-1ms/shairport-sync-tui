@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+import argparse
+import curses
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+try:
+    import dbus
+except ImportError:  # pragma: no cover - depends on host packages
+    dbus = None
+
+
+SERVICE = "org.gnome.ShairportSync"
+OBJECT = "/org/gnome/ShairportSync"
+PROPS = "org.freedesktop.DBus.Properties"
+CORE_IFACE = "org.gnome.ShairportSync"
+REMOTE_IFACE = "org.gnome.ShairportSync.RemoteControl"
+ADVANCED_IFACE = "org.gnome.ShairportSync.AdvancedRemoteControl"
+DEFAULT_REFRESH_SECONDS = 1.0
+SYSTEM_REFRESH_SECONDS = 5.0
+SAMPLE_RATE = 44_100
+CONFIG_PATH = Path("/etc/shairport-sync.conf")
+HISTORY_PATH = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "shairport-tui" / "history.json"
+HISTORY_LIMIT = 12
+
+
+@dataclass
+class Snapshot:
+    ok: bool
+    error: str = ""
+    active: bool = False
+    available: bool = False
+    player_state: str = "Unknown"
+    client: str = ""
+    airplay_volume: float | None = None
+    volume_percent: float | None = None
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    genre: str = ""
+    art_url: str = ""
+    elapsed_seconds: float | None = None
+    duration_seconds: float | None = None
+    progress_estimated: bool = False
+    version: str = ""
+    updated_at: dt.datetime = field(default_factory=dt.datetime.now)
+
+
+@dataclass
+class UnitStatus:
+    name: str
+    active: str = "unknown"
+    sub: str = "unknown"
+    pid: str = "-"
+    restarts: str = "-"
+    started: str = "-"
+    error: str = ""
+
+
+@dataclass
+class AudioStatus:
+    backend: str = "-"
+    output_device: str = "-"
+    mixer: str = "-"
+    pulse_server: str = "-"
+    default_sink: str = "-"
+    alsa_volume: str = "-"
+    devices: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SystemSnapshot:
+    units: list[UnitStatus] = field(default_factory=list)
+    audio: AudioStatus = field(default_factory=AudioStatus)
+    logs: list[str] = field(default_factory=list)
+    updated_at: dt.datetime = field(default_factory=dt.datetime.now)
+
+
+def unwrap(value: Any) -> Any:
+    if dbus is not None:
+        if isinstance(value, (dbus.String, dbus.ObjectPath)):
+            return str(value)
+        if isinstance(value, dbus.Boolean):
+            return bool(value)
+        if isinstance(
+            value,
+            (
+                dbus.Byte,
+                dbus.Int16,
+                dbus.Int32,
+                dbus.Int64,
+                dbus.UInt16,
+                dbus.UInt32,
+                dbus.UInt64,
+            ),
+        ):
+            return int(value)
+        if isinstance(value, dbus.Double):
+            return float(value)
+        if isinstance(value, (dbus.Array, list, tuple)):
+            return [unwrap(item) for item in value]
+        if isinstance(value, (dbus.Dictionary, dict)):
+            return {str(unwrap(key)): unwrap(item) for key, item in value.items()}
+    return value
+
+
+def as_text(value: Any) -> str:
+    value = unwrap(value)
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(as_text(item) for item in value if as_text(item))
+    return str(value)
+
+
+def as_bool(value: Any) -> bool:
+    return bool(unwrap(value))
+
+
+def as_float(value: Any) -> float | None:
+    try:
+        return float(unwrap(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_progress(progress: str) -> tuple[float | None, float | None]:
+    try:
+        start_raw, current_raw, end_raw = (int(part) for part in progress.split("/", 2))
+    except (AttributeError, ValueError):
+        return None, None
+
+    elapsed = max(0, current_raw - start_raw) / SAMPLE_RATE
+    duration = max(0, end_raw - start_raw) / SAMPLE_RATE
+    if duration <= 0:
+        duration = None
+    return elapsed, duration
+
+
+def format_seconds(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--"
+    seconds = max(0, int(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:d}:{seconds:02d}"
+
+
+def run_cmd(args: list[str], timeout: float = 2.0) -> tuple[bool, str]:
+    if not shutil.which(args[0]):
+        return False, f"{args[0]} not found"
+    try:
+        completed = subprocess.run(
+            args,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return False, str(exc)
+    output = completed.stdout.strip() or completed.stderr.strip()
+    return completed.returncode == 0, output
+
+
+class ShairportReader:
+    def __init__(self) -> None:
+        if dbus is None:
+            raise RuntimeError("python3-dbus is not installed")
+        self.bus = dbus.SystemBus()
+        self.obj = self.bus.get_object(SERVICE, OBJECT)
+        self.props = dbus.Interface(self.obj, PROPS)
+        self.remote = dbus.Interface(self.obj, REMOTE_IFACE)
+
+    def read(self) -> Snapshot:
+        core = self.props.GetAll(CORE_IFACE)
+        remote = self.props.GetAll(REMOTE_IFACE)
+
+        metadata = unwrap(remote.get("Metadata", {}))
+        elapsed, duration = parse_progress(as_text(remote.get("ProgressString")))
+        mpris_length = as_float(metadata.get("mpris:length"))
+        if duration is None and mpris_length:
+            duration = mpris_length / 1_000_000
+
+        airplay_volume = as_float(remote.get("AirplayVolume"))
+        volume_percent = None
+        if airplay_volume is not None:
+            # AirPlay reports 0 dB as full scale and -30 dB as silence-ish.
+            volume_percent = max(0.0, min(100.0, (30.0 + airplay_volume) / 30.0 * 100.0))
+
+        return Snapshot(
+            ok=True,
+            active=as_bool(core.get("Active")),
+            available=as_bool(remote.get("Available")),
+            player_state=as_text(remote.get("PlayerState")) or "Unknown",
+            client=as_text(remote.get("Client")),
+            airplay_volume=airplay_volume,
+            volume_percent=volume_percent,
+            title=as_text(metadata.get("xesam:title")),
+            artist=as_text(metadata.get("xesam:artist")),
+            album=as_text(metadata.get("xesam:album")),
+            genre=as_text(metadata.get("xesam:genre")),
+            art_url=as_text(metadata.get("mpris:artUrl")),
+            elapsed_seconds=elapsed,
+            duration_seconds=duration,
+            version=as_text(core.get("VersionString")),
+        )
+
+    def command(self, name: str) -> str:
+        methods = {
+            "toggle": "PlayPause",
+            "next": "Next",
+            "previous": "Previous",
+            "stop": "Stop",
+            "play": "Play",
+            "pause": "Pause",
+            "mute": "ToggleMute",
+            "volume_up": "VolumeUp",
+            "volume_down": "VolumeDown",
+        }
+        method = methods[name]
+        getattr(self.remote, method)()
+        return method
+
+
+class ProgressClock:
+    def __init__(self) -> None:
+        self.track_key: tuple[str, str, str, float | None] | None = None
+        self.anchor_elapsed: float | None = None
+        self.anchor_time = time.monotonic()
+        self.last_reported_elapsed: float | None = None
+
+    def apply(self, snap: Snapshot) -> Snapshot:
+        key = (snap.title, snap.artist, snap.album, snap.duration_seconds)
+        now = time.monotonic()
+        reported = snap.elapsed_seconds
+
+        if key != self.track_key:
+            self.track_key = key
+            self.anchor_elapsed = reported
+            self.last_reported_elapsed = reported
+            self.anchor_time = now
+            snap.progress_estimated = False
+            return snap
+
+        if reported is not None and (
+            self.last_reported_elapsed is None
+            or abs(reported - self.last_reported_elapsed) > 0.5
+        ):
+            self.anchor_elapsed = reported
+            self.last_reported_elapsed = reported
+            self.anchor_time = now
+            snap.progress_estimated = False
+            return snap
+
+        if snap.player_state.lower() == "playing" and self.anchor_elapsed is not None:
+            elapsed = self.anchor_elapsed + (now - self.anchor_time)
+            if snap.duration_seconds is not None:
+                elapsed = min(elapsed, snap.duration_seconds)
+            snap.elapsed_seconds = elapsed
+            snap.progress_estimated = True
+        elif self.anchor_elapsed is not None:
+            snap.elapsed_seconds = self.anchor_elapsed
+            snap.progress_estimated = reported != self.anchor_elapsed
+
+        return snap
+
+
+class HistoryStore:
+    def __init__(self, path: Path = HISTORY_PATH) -> None:
+        self.path = path
+        self.items: list[dict[str, str]] = []
+        self.load()
+
+    def load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text())
+        except Exception:
+            data = []
+        if isinstance(data, list):
+            self.items = [item for item in data if isinstance(item, dict)]
+
+    def save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.items[:HISTORY_LIMIT], indent=2, sort_keys=True) + "\n")
+        except Exception:
+            pass
+
+    def record(self, snap: Snapshot) -> None:
+        if not snap.ok or not snap.client:
+            return
+        now = dt.datetime.now().replace(microsecond=0).isoformat(sep=" ")
+        track = " - ".join(part for part in (snap.artist, snap.title) if part)
+        existing = next((item for item in self.items if item.get("client") == snap.client), None)
+        if existing is None:
+            existing = {"client": snap.client, "first_seen": now}
+            self.items.insert(0, existing)
+        else:
+            self.items.remove(existing)
+            self.items.insert(0, existing)
+        existing["last_seen"] = now
+        existing["last_state"] = snap.player_state
+        if track:
+            existing["last_track"] = track
+        del self.items[HISTORY_LIMIT:]
+        self.save()
+
+
+def parse_config() -> dict[str, str]:
+    try:
+        text = CONFIG_PATH.read_text()
+    except Exception:
+        return {}
+    result: dict[str, str] = {}
+    for key in ("output_backend", "output_device", "mixer_control_name", "mixer_device"):
+        match = re.search(rf"^\s*{key}\s*=\s*\"([^\"]*)\"", text, re.MULTILINE)
+        if match:
+            result[key] = match.group(1)
+    return result
+
+
+def read_unit(name: str) -> UnitStatus:
+    ok, output = run_cmd(
+        [
+            "systemctl",
+            "show",
+            name,
+            "--property=Id,ActiveState,SubState,MainPID,NRestarts,ExecMainStartTimestamp",
+            "--no-pager",
+        ]
+    )
+    status = UnitStatus(name=name)
+    if not ok:
+        status.error = output
+        return status
+    values: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+    status.active = values.get("ActiveState") or "unknown"
+    status.sub = values.get("SubState") or "unknown"
+    status.pid = values.get("MainPID") or "-"
+    status.restarts = values.get("NRestarts") or "-"
+    status.started = values.get("ExecMainStartTimestamp") or "-"
+    return status
+
+
+def read_audio() -> AudioStatus:
+    config = parse_config()
+    audio = AudioStatus(
+        backend=config.get("output_backend", "alsa"),
+        output_device=config.get("output_device", "-"),
+        mixer=config.get("mixer_control_name") or config.get("mixer_device") or "-",
+    )
+
+    ok, output = run_cmd(["pactl", "info"])
+    if ok:
+        for line in output.splitlines():
+            if line.startswith("Server Name:"):
+                audio.pulse_server = line.split(":", 1)[1].strip()
+            elif line.startswith("Default Sink:"):
+                audio.default_sink = line.split(":", 1)[1].strip()
+    else:
+        audio.errors.append(output)
+
+    mixer_name = audio.mixer if audio.mixer != "-" else "PCM"
+    amixer_args = ["amixer", "get", mixer_name]
+    if audio.output_device != "-":
+        amixer_args = ["amixer", "-D", audio.output_device, "get", mixer_name]
+    ok, output = run_cmd(amixer_args)
+    if not ok and audio.output_device != "-":
+        ok, output = run_cmd(["amixer", "get", mixer_name])
+    if ok:
+        matches = re.findall(r"\[(\d+%)\]", output)
+        states = re.findall(r"\[(on|off)\]", output)
+        if matches:
+            audio.alsa_volume = matches[-1] + (f" {states[-1]}" if states else "")
+    else:
+        audio.errors.append(output)
+
+    ok, output = run_cmd(["aplay", "-l"])
+    if ok:
+        for line in output.splitlines():
+            if line.startswith("card "):
+                audio.devices.append(re.sub(r"\s+", " ", line).strip())
+                if len(audio.devices) >= 3:
+                    break
+    else:
+        audio.errors.append(output)
+
+    return audio
+
+
+def read_logs() -> list[str]:
+    ok, output = run_cmd(
+        ["journalctl", "-u", "shairport-sync.service", "-n", "8", "--no-pager", "--output=short-iso"],
+        timeout=4.0,
+    )
+    if not ok:
+        return [output]
+    return [line for line in output.splitlines() if line.strip()][-8:]
+
+
+class SystemReader:
+    def __init__(self) -> None:
+        self.next_refresh = 0.0
+        self.snapshot = SystemSnapshot()
+
+    def read(self, force: bool = False) -> SystemSnapshot:
+        now = time.monotonic()
+        if not force and now < self.next_refresh:
+            return self.snapshot
+        self.snapshot = SystemSnapshot(
+            units=[read_unit("shairport-sync.service"), read_unit("avahi-daemon.service")],
+            audio=read_audio(),
+            logs=read_logs(),
+        )
+        self.next_refresh = now + SYSTEM_REFRESH_SECONDS
+        return self.snapshot
+
+
+def clipped(text: Any, width: int) -> str:
+    text = str(text)
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "?"
+
+
+def add_line(win: curses.window, row: int, col: int, text: Any, attr: int = 0, max_width: int | None = None) -> None:
+    height, width = win.getmaxyx()
+    if 0 <= row < height and col < width:
+        available = width - col - 1
+        if max_width is not None:
+            available = min(available, max_width)
+        win.addstr(row, col, clipped(text, available), attr)
+
+
+def draw_bar(win: curses.window, row: int, col: int, width: int, fraction: float | None) -> None:
+    width = max(8, width)
+    if fraction is None:
+        fill = 0
+    else:
+        fill = max(0, min(width, int(width * fraction)))
+    add_line(win, row, col, "[" + "#" * fill + "-" * (width - fill) + "]")
+
+
+def section(win: curses.window, row: int, title: str, attr: int) -> int:
+    add_line(win, row, 0, title, attr)
+    return row + 1
+
+
+def draw_compact(stdscr: curses.window, snap: Snapshot, refresh_seconds: float, message: str) -> None:
+    stdscr.erase()
+    _, width = stdscr.getmaxyx()
+    muted_attr = curses.A_DIM
+    good_attr = curses.color_pair(3) | curses.A_BOLD
+    warn_attr = curses.color_pair(4) | curses.A_BOLD
+    if not snap.ok:
+        add_line(stdscr, 0, 0, f"Shairport Sync | error: {snap.error}", warn_attr)
+        stdscr.refresh()
+        return
+    connected = snap.available and snap.client
+    status = "Connected" if connected else "Idle"
+    track = " - ".join(part for part in (snap.artist, snap.title) if part) or "-"
+    elapsed = format_seconds(snap.elapsed_seconds)
+    duration = format_seconds(snap.duration_seconds)
+    volume = "-"
+    if snap.airplay_volume is not None:
+        volume = f"{snap.airplay_volume:.1f} dB"
+    client = snap.client or "-"
+    if not connected and snap.client:
+        client = f"last {snap.client}"
+    line = f"{status} | {client} | {track} | {elapsed}/{duration} | {volume}"
+    add_line(stdscr, 0, 0, line, good_attr if connected else muted_attr)
+    add_line(stdscr, 1, 0, f"auto {refresh_seconds:g}s | SPC play/pause | n/p | +/- | r | c full | q", muted_attr)
+    if message:
+        add_line(stdscr, 2, max(0, width - len(message) - 1), message, warn_attr if message.startswith("error") else muted_attr)
+    stdscr.refresh()
+
+
+def draw_full(
+    stdscr: curses.window,
+    snap: Snapshot,
+    system: SystemSnapshot,
+    history: HistoryStore,
+    refresh_seconds: float,
+    message: str,
+) -> None:
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    title_attr = curses.color_pair(1) | curses.A_BOLD
+    muted_attr = curses.A_DIM
+    good_attr = curses.color_pair(3) | curses.A_BOLD
+    warn_attr = curses.color_pair(4) | curses.A_BOLD
+
+    add_line(stdscr, 0, 0, "Shairport Sync", title_attr)
+    add_line(stdscr, 0, max(0, width - 22), dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), muted_attr)
+    add_line(
+        stdscr,
+        1,
+        0,
+        f"auto {refresh_seconds:g}s | SPC play/pause | n/p | s stop | +/- vol | m mute | c | r | q",
+        muted_attr,
+    )
+    add_line(stdscr, 2, 0, "-" * max(0, width - 1), muted_attr)
+    if message:
+        add_line(stdscr, 3, 0, message, warn_attr if message.startswith("error") else muted_attr)
+
+    if not snap.ok:
+        add_line(stdscr, 5, 0, "Status", warn_attr)
+        add_line(stdscr, 6, 2, snap.error or "Unable to read Shairport Sync.", warn_attr)
+        add_line(stdscr, 8, 2, "Check shairport-sync and system D-Bus access.", muted_attr)
+        stdscr.refresh()
+        return
+
+    left_width = max(38, width // 2 - 1)
+    right_col = left_width + 2
+    right_width = max(1, width - right_col - 1)
+
+    def left(row_num: int, col: int, text: Any, attr: int = 0) -> None:
+        add_line(stdscr, row_num, col, text, attr, max_width=max(1, left_width - col))
+
+    def right(row_num: int, text: Any, attr: int = 0, indent: int = 0) -> None:
+        add_line(stdscr, row_num, right_col + indent, text, attr, max_width=max(1, right_width - indent))
+
+    row = 4
+
+    connected = snap.available and snap.client
+    status = "Connected" if connected else "Idle"
+    status_attr = good_attr if connected else muted_attr
+    left(row, 0, "Connection", title_attr)
+    row += 1
+    left(row, 2, f"Status: {status}", status_attr)
+    row += 1
+    left(row, 2, f"{'Client' if connected else 'Last client'}: {snap.client or '-'}")
+    row += 1
+    left(row, 2, f"Session active: {'yes' if snap.active else 'no'}")
+    row += 1
+    left(row, 2, f"Player state: {snap.player_state}")
+    row += 1
+    volume = "-"
+    if snap.airplay_volume is not None:
+        volume = f"{snap.airplay_volume:.1f} dB"
+        if snap.volume_percent is not None:
+            volume += f" ({snap.volume_percent:.0f}%)"
+    left(row, 2, f"AirPlay volume: {volume}")
+    row += 2
+
+    left(row, 0, "Now Playing", title_attr)
+    row += 1
+    left(row, 2, f"Title:  {snap.title or '-'}")
+    row += 1
+    left(row, 2, f"Artist: {snap.artist or '-'}")
+    row += 1
+    left(row, 2, f"Album:  {snap.album or '-'}")
+    row += 1
+    left(row, 2, f"Genre:  {snap.genre or '-'}")
+    row += 2
+
+    left(row, 0, "Progress", title_attr)
+    row += 1
+    estimated = " estimated" if snap.progress_estimated else ""
+    left(row, 2, f"{format_seconds(snap.elapsed_seconds)} / {format_seconds(snap.duration_seconds)}{estimated}")
+    row += 1
+    fraction = None
+    if snap.elapsed_seconds is not None and snap.duration_seconds:
+        fraction = snap.elapsed_seconds / snap.duration_seconds
+    draw_bar(stdscr, row, 2, min(left_width - 5, width - 5), fraction)
+    row += 2
+
+    left(row, 0, "Connection History", title_attr)
+    row += 1
+    if history.items:
+        for item in history.items[: max(1, min(4, height - row - 1))]:
+            track = item.get("last_track", "-")
+            left(row, 2, f"{item.get('client', '-')} | {item.get('last_state', '-')} | {track}")
+            row += 1
+    else:
+        left(row, 2, "No history yet.", muted_attr)
+
+    row = 4
+    if right_col < width - 20:
+        right(row, "Service Health", title_attr)
+        row += 1
+        for unit in system.units:
+            state = f"{unit.active}/{unit.sub}"
+            attr = good_attr if unit.active == "active" else warn_attr
+            right(row, f"{unit.name}: {state} pid={unit.pid} restarts={unit.restarts}", attr)
+            row += 1
+            if unit.error:
+                right(row, unit.error, warn_attr, indent=2)
+                row += 1
+        row += 1
+
+        right(row, "Audio Output", title_attr)
+        row += 1
+        audio = system.audio
+        right(row, f"Backend: {audio.backend}")
+        row += 1
+        right(row, f"Output:  {audio.output_device}")
+        row += 1
+        right(row, f"Mixer:   {audio.mixer} {audio.alsa_volume}")
+        row += 1
+        right(row, f"Pulse:   {audio.default_sink or audio.pulse_server or '-'}")
+        row += 1
+        for device in audio.devices[:2]:
+            right(row, device, muted_attr)
+            row += 1
+        row += 1
+
+        right(row, "Recent Logs", title_attr)
+        row += 1
+        remaining = max(0, height - row - 1)
+        for line in system.logs[-remaining:]:
+            right(row, line, muted_attr)
+            row += 1
+
+    if height > 4:
+        add_line(stdscr, height - 1, 0, f"Build: {snap.version or '-'}", muted_attr)
+    stdscr.refresh()
+
+
+def read_snapshot(reader: ShairportReader | None) -> tuple[ShairportReader | None, Snapshot]:
+    try:
+        if reader is None:
+            reader = ShairportReader()
+        return reader, reader.read()
+    except Exception as exc:
+        return None, Snapshot(ok=False, error=str(exc))
+
+
+def handle_key(key: int, reader: ShairportReader | None) -> tuple[str | None, bool, bool]:
+    if key in (ord("q"), ord("Q"), 27):
+        return None, True, False
+    if key in (ord("c"), ord("C")):
+        return "toggle compact", False, True
+    if key < 0:
+        return None, False, False
+    if reader is None:
+        return "error: Shairport D-Bus unavailable", False, False
+    mapping = {
+        ord(" "): "toggle",
+        ord("n"): "next",
+        ord("N"): "next",
+        ord("p"): "previous",
+        ord("P"): "previous",
+        ord("s"): "stop",
+        ord("S"): "stop",
+        ord("m"): "mute",
+        ord("M"): "mute",
+        ord("+"): "volume_up",
+        ord("="): "volume_up",
+        ord("-"): "volume_down",
+        ord("_"): "volume_down",
+    }
+    action = mapping.get(key)
+    if not action:
+        return None, False, False
+    try:
+        method = reader.command(action)
+    except Exception as exc:
+        return f"error: {exc}", False, False
+    return f"sent {method}", False, False
+
+
+def run(stdscr: curses.window, refresh_seconds: float, compact: bool) -> None:
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(3, curses.COLOR_GREEN, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(max(50, min(250, int(refresh_seconds * 1000 / 4))))
+
+    reader: ShairportReader | None = None
+    progress_clock = ProgressClock()
+    system_reader = SystemReader()
+    history = HistoryStore()
+    snap = Snapshot(ok=False, error="Starting...")
+    system = system_reader.read(force=True)
+    next_refresh = 0.0
+    message = ""
+    message_until = 0.0
+
+    while True:
+        now = time.monotonic()
+        if now >= next_refresh:
+            reader, snap = read_snapshot(reader)
+            if snap.ok:
+                snap = progress_clock.apply(snap)
+                history.record(snap)
+            system = system_reader.read()
+            if now >= message_until:
+                message = ""
+            if compact or stdscr.getmaxyx()[0] < 18 or stdscr.getmaxyx()[1] < 72:
+                draw_compact(stdscr, snap, refresh_seconds, message)
+            else:
+                draw_full(stdscr, snap, system, history, refresh_seconds, message)
+            next_refresh = now + refresh_seconds
+
+        key = stdscr.getch()
+        if key in (ord("r"), ord("R")):
+            next_refresh = 0.0
+            system = system_reader.read(force=True)
+            continue
+        new_message, should_quit, toggle_compact = handle_key(key, reader)
+        if should_quit:
+            return
+        if toggle_compact:
+            compact = not compact
+            next_refresh = 0.0
+        if new_message:
+            message = new_message
+            message_until = time.monotonic() + 2.5
+            next_refresh = 0.0
+
+
+def check_line(label: str, ok: bool, detail: str) -> str:
+    status = "ok" if ok else "fail"
+    return f"{status:4} {label}: {detail}"
+
+
+def doctor() -> int:
+    failures = 0
+    print("shairport-tui doctor")
+    print()
+
+    for command in ("python3", "systemctl", "journalctl", "pactl", "amixer", "aplay"):
+        path = shutil.which(command)
+        ok = path is not None
+        failures += 0 if ok else 1
+        print(check_line(command, ok, path or "not found"))
+
+    print(check_line("python3-dbus", dbus is not None, "importable" if dbus is not None else "not importable"))
+    if dbus is None:
+        failures += 1
+    else:
+        try:
+            snap = ShairportReader().read()
+            print(check_line("Shairport D-Bus", snap.ok, snap.version or snap.error))
+            print(check_line("Current client", bool(snap.client), snap.client or "none"))
+        except Exception as exc:
+            failures += 1
+            print(check_line("Shairport D-Bus", False, str(exc)))
+
+    for unit_name in ("shairport-sync.service", "avahi-daemon.service"):
+        unit = read_unit(unit_name)
+        ok = unit.active == "active"
+        failures += 0 if ok else 1
+        detail = f"{unit.active}/{unit.sub} pid={unit.pid}"
+        if unit.error:
+            detail = unit.error
+        print(check_line(unit_name, ok, detail))
+
+    config = parse_config()
+    print(check_line("config", bool(config), str(CONFIG_PATH) if config else "no explicit output settings found"))
+    if config:
+        print(f"     backend={config.get('output_backend', 'alsa')} output={config.get('output_device', '-')} mixer={config.get('mixer_control_name', '-')}")
+
+    ok, output = run_cmd(["journalctl", "-u", "shairport-sync.service", "-n", "1", "--no-pager"], timeout=4.0)
+    print(check_line("journal", ok, output.splitlines()[-1] if output else "readable"))
+
+    audio = read_audio()
+    print(check_line("audio config", True, f"backend={audio.backend} output={audio.output_device} mixer={audio.mixer} volume={audio.alsa_volume}"))
+    if audio.errors:
+        print("     audio warnings:")
+        for error in audio.errors[:3]:
+            print(f"     - {error}")
+
+    print()
+    print(f"History file: {HISTORY_PATH}")
+    return 1 if failures else 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Terminal dashboard for Shairport Sync.")
+    parser.add_argument(
+        "-i",
+        "--interval",
+        type=float,
+        default=DEFAULT_REFRESH_SECONDS,
+        help=f"auto-refresh interval in seconds (default: {DEFAULT_REFRESH_SECONDS:g})",
+    )
+    parser.add_argument("--compact", action="store_true", help="start in compact one-line mode")
+    parser.add_argument("--doctor", action="store_true", help="run diagnostics and exit")
+    args = parser.parse_args()
+    if args.interval <= 0:
+        parser.error("--interval must be greater than 0")
+
+    if args.doctor:
+        raise SystemExit(doctor())
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("shairport-tui needs an interactive terminal.", file=sys.stderr)
+        raise SystemExit(2)
+    signal.signal(signal.SIGINT, lambda _signum, _frame: raise_keyboard_interrupt())
+    curses.wrapper(run, args.interval, args.compact)
+
+
+def raise_keyboard_interrupt() -> None:
+    raise KeyboardInterrupt
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
