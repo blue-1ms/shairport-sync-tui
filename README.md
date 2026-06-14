@@ -24,7 +24,11 @@ Sync's D-Bus remote-control interface.
   ALSA volume, and detected playback devices.
 - Recent `journalctl` logs in the debug screen.
 - Persistent connection history in `~/.cache/shairport-tui/history.json`.
+- Scrollable debug view for longer logs and history.
+- In-app help overlay with `?`.
 - `--doctor` diagnostics for dependencies, services, D-Bus, logs, and audio.
+- `--clear-history` for deleting saved connection history.
+- `--no-color` for plain terminal output.
 
 ## Requirements
 
@@ -63,6 +67,12 @@ cd shairport-sync-tui
 install -Dm755 shairport-tui ~/.local/bin/shairport-tui
 ```
 
+Or use `make`:
+
+```bash
+make install
+```
+
 You can also run it directly from the checkout:
 
 ```bash
@@ -89,6 +99,18 @@ Run diagnostics:
 shairport-tui --doctor
 ```
 
+Clear saved connection history:
+
+```bash
+shairport-tui --clear-history
+```
+
+Disable color output:
+
+```bash
+shairport-tui --no-color
+```
+
 ## Controls
 
 | Key | Action |
@@ -102,6 +124,10 @@ shairport-tui --doctor
 | `m` | Toggle mute |
 | `r` | Refresh now |
 | `d` | Toggle debug view |
+| `?` or `h` | Toggle help |
+| `j` / `k` or arrows | Scroll debug view |
+| `f` / `b` or Page Down / Page Up | Page debug view |
+| `g` / `G` or Home / End | Jump debug view to top / bottom |
 | `q` or `Esc` | Quit |
 
 ## Views

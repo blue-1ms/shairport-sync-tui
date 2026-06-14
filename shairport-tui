@@ -32,6 +32,7 @@ SAMPLE_RATE = 44_100
 CONFIG_PATH = Path("/etc/shairport-sync.conf")
 HISTORY_PATH = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "shairport-tui" / "history.json"
 HISTORY_LIMIT = 12
+USE_COLOR = True
 
 
 @dataclass
@@ -301,6 +302,15 @@ class HistoryStore:
         except Exception:
             pass
 
+    def clear(self) -> None:
+        self.items = []
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            self.save()
+
     def record(self, snap: Snapshot) -> None:
         if not snap.ok or not snap.client:
             return
@@ -409,12 +419,12 @@ def read_audio() -> AudioStatus:
 
 def read_logs() -> list[str]:
     ok, output = run_cmd(
-        ["journalctl", "-u", "shairport-sync.service", "-n", "8", "--no-pager", "--output=short-iso"],
+        ["journalctl", "-u", "shairport-sync.service", "-n", "80", "--no-pager", "--output=short-iso"],
         timeout=4.0,
     )
     if not ok:
         return [output]
-    return [line for line in output.splitlines() if line.strip()][-8:]
+    return [line for line in output.splitlines() if line.strip()][-80:]
 
 
 class SystemReader:
@@ -446,6 +456,10 @@ def clipped(text: Any, width: int) -> str:
     return text[: width - 1] + "?"
 
 
+def pair(number: int) -> int:
+    return curses.color_pair(number) if USE_COLOR else 0
+
+
 def add_line(win: curses.window, row: int, col: int, text: Any, attr: int = 0, max_width: int | None = None) -> None:
     height, width = win.getmaxyx()
     if 0 <= row < height and col < width:
@@ -466,12 +480,13 @@ def draw_bar(win: curses.window, row: int, col: int, width: int, fraction: float
 
 def draw_header(stdscr: curses.window, view: str, refresh_seconds: float, message: str) -> None:
     _, width = stdscr.getmaxyx()
-    title_attr = curses.color_pair(1) | curses.A_BOLD
+    title_attr = pair(1) | curses.A_BOLD
     muted_attr = curses.A_DIM
-    warn_attr = curses.color_pair(4) | curses.A_BOLD
+    warn_attr = pair(4) | curses.A_BOLD
     add_line(stdscr, 0, 0, "Shairport Sync", title_attr)
     add_line(stdscr, 0, max(0, width - 22), dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), muted_attr)
-    add_line(stdscr, 1, 0, f"{view} | SPC play/pause | n/p | +/- vol | m mute | s stop | d debug | r | q", muted_attr)
+    toggle = "main" if view == "debug" else "debug"
+    add_line(stdscr, 1, 0, f"{view} | SPC play | n/p | +/- | m mute | s stop | d {toggle} | ? help | r | q", muted_attr)
     add_line(stdscr, 2, 0, "-" * max(0, width - 1), muted_attr)
     if message:
         add_line(stdscr, 3, 0, message, warn_attr if message.startswith("error") else muted_attr)
@@ -485,10 +500,10 @@ def draw_main(
 ) -> None:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
-    title_attr = curses.color_pair(1) | curses.A_BOLD
+    title_attr = pair(1) | curses.A_BOLD
     muted_attr = curses.A_DIM
-    good_attr = curses.color_pair(3) | curses.A_BOLD
-    warn_attr = curses.color_pair(4) | curses.A_BOLD
+    good_attr = pair(3) | curses.A_BOLD
+    warn_attr = pair(4) | curses.A_BOLD
 
     draw_header(stdscr, "main", refresh_seconds, message)
 
@@ -551,66 +566,92 @@ def draw_debug(
     history: HistoryStore,
     refresh_seconds: float,
     message: str,
-) -> None:
+    scroll: int,
+) -> int:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
-    title_attr = curses.color_pair(1) | curses.A_BOLD
+    title_attr = pair(1) | curses.A_BOLD
     muted_attr = curses.A_DIM
-    good_attr = curses.color_pair(3) | curses.A_BOLD
-    warn_attr = curses.color_pair(4) | curses.A_BOLD
+    good_attr = pair(3) | curses.A_BOLD
+    warn_attr = pair(4) | curses.A_BOLD
 
     draw_header(stdscr, "debug", refresh_seconds, message)
-    add_line(stdscr, 3, max(0, width - 28), "d: back to main", muted_attr)
+    add_line(stdscr, 3, max(0, width - 40), "d: main | j/k or arrows scroll", muted_attr)
 
-    row = 5
-    add_line(stdscr, row, 0, "Service Health", title_attr)
-    row += 1
+    rows: list[tuple[int, Any, int]] = []
+    rows.append((0, "Service Health", title_attr))
     for unit in system.units:
         state = f"{unit.active}/{unit.sub}"
         attr = good_attr if unit.active == "active" else warn_attr
-        add_line(stdscr, row, 2, f"{unit.name}: {state} pid={unit.pid} restarts={unit.restarts}", attr)
-        row += 1
+        rows.append((2, f"{unit.name}: {state} pid={unit.pid} restarts={unit.restarts}", attr))
         if unit.error:
-            add_line(stdscr, row, 4, unit.error, warn_attr)
-            row += 1
-    row += 1
+            rows.append((4, unit.error, warn_attr))
+    rows.append((0, "", 0))
 
-    add_line(stdscr, row, 0, "Audio Output", title_attr)
-    row += 1
     audio = system.audio
-    add_line(stdscr, row, 2, f"Backend: {audio.backend}   Output: {audio.output_device}   Mixer: {audio.mixer} {audio.alsa_volume}")
-    row += 1
-    add_line(stdscr, row, 2, f"Pulse: {audio.default_sink or audio.pulse_server or '-'}")
-    row += 1
+    rows.append((0, "Audio Output", title_attr))
+    rows.append((2, f"Backend: {audio.backend}   Output: {audio.output_device}   Mixer: {audio.mixer} {audio.alsa_volume}", 0))
+    rows.append((2, f"Pulse: {audio.default_sink or audio.pulse_server or '-'}", 0))
     for device in audio.devices[:3]:
-        add_line(stdscr, row, 2, device, muted_attr)
-        row += 1
+        rows.append((2, device, muted_attr))
     for error in audio.errors[:2]:
-        add_line(stdscr, row, 2, error, warn_attr)
-        row += 1
-    row += 1
+        rows.append((2, error, warn_attr))
+    rows.append((0, "", 0))
 
-    add_line(stdscr, row, 0, "Connection History", title_attr)
-    row += 1
+    rows.append((0, "Connection History", title_attr))
     if history.items:
-        for item in history.items[: max(1, min(5, height - row - 8))]:
+        for item in history.items:
             track = item.get("last_track", "-")
-            add_line(stdscr, row, 2, f"{item.get('client', '-')} | {item.get('last_state', '-')} | {track}")
-            row += 1
+            rows.append((2, f"{item.get('client', '-')} | {item.get('last_state', '-')} | {track}", 0))
     else:
-        add_line(stdscr, row, 2, "No history yet.", muted_attr)
-        row += 1
-    row += 1
+        rows.append((2, "No history yet.", muted_attr))
+    rows.append((0, "", 0))
 
-    add_line(stdscr, row, 0, "Recent Logs", title_attr)
-    row += 1
-    remaining = max(0, height - row - 2)
-    for line in system.logs[-remaining:]:
-        add_line(stdscr, row, 2, line, muted_attr)
-        row += 1
+    rows.append((0, "Recent Logs", title_attr))
+    for line in system.logs:
+        rows.append((2, line, muted_attr))
+
+    start_row = 5
+    available = max(1, height - start_row - 1)
+    max_scroll = max(0, len(rows) - available)
+    scroll = max(0, min(scroll, max_scroll))
+    for screen_row, (indent, text, attr) in enumerate(rows[scroll : scroll + available], start=start_row):
+        add_line(stdscr, screen_row, indent, text, attr)
 
     if height > 4:
-        add_line(stdscr, height - 1, 0, f"Build: {snap.version or '-'}", muted_attr)
+        position = f"scroll {scroll}/{max_scroll}" if max_scroll else "scroll 0/0"
+        add_line(stdscr, height - 1, 0, f"{position} | Build: {snap.version or '-'}", muted_attr)
+    stdscr.refresh()
+    return max_scroll
+
+
+def draw_help(stdscr: curses.window, refresh_seconds: float, message: str) -> None:
+    stdscr.erase()
+    title_attr = pair(1) | curses.A_BOLD
+    muted_attr = curses.A_DIM
+    draw_header(stdscr, "help", refresh_seconds, message)
+    lines = [
+        ("Keys", title_attr),
+        ("  Space       Play or pause", 0),
+        ("  n / p       Next / previous track", 0),
+        ("  + / -       Volume up / down", 0),
+        ("  m           Toggle mute", 0),
+        ("  s           Stop playback", 0),
+        ("  d           Toggle main/debug view", 0),
+        ("  r           Refresh now", 0),
+        ("  j/k, arrows Scroll debug view", 0),
+        ("  ? or h      Toggle this help", 0),
+        ("  q or Esc    Quit", 0),
+        ("", 0),
+        ("Commands", title_attr),
+        ("  shairport-tui --doctor         Check services, D-Bus, logs, and audio", 0),
+        ("  shairport-tui --clear-history  Delete saved connection history", 0),
+        ("  shairport-tui --no-color       Disable color output", 0),
+        ("", 0),
+        ("Press ? or h to return.", muted_attr),
+    ]
+    for row, (text, attr) in enumerate(lines, start=5):
+        add_line(stdscr, row, 0, text, attr)
     stdscr.refresh()
 
 
@@ -652,15 +693,28 @@ def handle_key(key: int, reader: ShairportReader | None) -> tuple[str | None, bo
         method = reader.command(action)
     except Exception as exc:
         return f"error: {exc}", False
-    return f"sent {method}", False
+    labels = {
+        "PlayPause": "play/pause",
+        "Next": "next track",
+        "Previous": "previous track",
+        "Stop": "stop",
+        "ToggleMute": "mute toggle",
+        "VolumeUp": "volume up",
+        "VolumeDown": "volume down",
+    }
+    return f"sent {labels.get(method, method)}", False
 
 
 def run(stdscr: curses.window, refresh_seconds: float) -> None:
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN, -1)
-    curses.init_pair(3, curses.COLOR_GREEN, -1)
-    curses.init_pair(4, curses.COLOR_RED, -1)
+    global USE_COLOR
+    USE_COLOR = USE_COLOR and curses.has_colors()
+    if USE_COLOR and curses.has_colors():
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_RED, -1)
     curses.curs_set(0)
+    stdscr.keypad(True)
     stdscr.nodelay(True)
     stdscr.timeout(max(50, min(250, int(refresh_seconds * 1000 / 4))))
 
@@ -674,6 +728,9 @@ def run(stdscr: curses.window, refresh_seconds: float) -> None:
     message = ""
     message_until = 0.0
     view = "main"
+    previous_view = "main"
+    debug_scroll = 0
+    debug_max_scroll = 0
 
     while True:
         now = time.monotonic()
@@ -685,8 +742,11 @@ def run(stdscr: curses.window, refresh_seconds: float) -> None:
             system = system_reader.read()
             if now >= message_until:
                 message = ""
-            if view == "debug":
-                draw_debug(stdscr, snap, system, history, refresh_seconds, message)
+            if view == "help":
+                draw_help(stdscr, refresh_seconds, message)
+            elif view == "debug":
+                debug_max_scroll = draw_debug(stdscr, snap, system, history, refresh_seconds, message, debug_scroll)
+                debug_scroll = min(debug_scroll, debug_max_scroll)
             else:
                 draw_main(stdscr, snap, refresh_seconds, message)
             next_refresh = now + refresh_seconds
@@ -696,10 +756,47 @@ def run(stdscr: curses.window, refresh_seconds: float) -> None:
             next_refresh = 0.0
             system = system_reader.read(force=True)
             continue
-        if key in (ord("d"), ord("D")):
-            view = "debug" if view == "main" else "main"
+        if key in (ord("?"), ord("h"), ord("H")):
+            if view == "help":
+                view = previous_view
+            else:
+                previous_view = view
+                view = "help"
             next_refresh = 0.0
             continue
+        if key in (ord("d"), ord("D")):
+            if view == "help":
+                previous_view = "debug" if previous_view == "main" else "main"
+            else:
+                view = "debug" if view == "main" else "main"
+            next_refresh = 0.0
+            continue
+        if view == "debug":
+            page = max(1, stdscr.getmaxyx()[0] - 7)
+            if key in (ord("j"), curses.KEY_DOWN):
+                debug_scroll = min(debug_scroll + 1, debug_max_scroll)
+                next_refresh = 0.0
+                continue
+            if key in (ord("k"), curses.KEY_UP):
+                debug_scroll = max(0, debug_scroll - 1)
+                next_refresh = 0.0
+                continue
+            if key in (curses.KEY_NPAGE, ord("f")):
+                debug_scroll = min(debug_scroll + page, debug_max_scroll)
+                next_refresh = 0.0
+                continue
+            if key in (curses.KEY_PPAGE, ord("b")):
+                debug_scroll = max(0, debug_scroll - page)
+                next_refresh = 0.0
+                continue
+            if key in (curses.KEY_HOME, ord("g")):
+                debug_scroll = 0
+                next_refresh = 0.0
+                continue
+            if key in (curses.KEY_END, ord("G")):
+                debug_scroll = debug_max_scroll
+                next_refresh = 0.0
+                continue
         new_message, should_quit = handle_key(key, reader)
         if should_quit:
             return
@@ -767,6 +864,7 @@ def doctor() -> int:
 
 
 def main() -> None:
+    global USE_COLOR
     parser = argparse.ArgumentParser(description="Terminal dashboard for Shairport Sync.")
     parser.add_argument(
         "-i",
@@ -776,12 +874,21 @@ def main() -> None:
         help=f"auto-refresh interval in seconds (default: {DEFAULT_REFRESH_SECONDS:g})",
     )
     parser.add_argument("--doctor", action="store_true", help="run diagnostics and exit")
+    parser.add_argument("--clear-history", action="store_true", help="delete saved connection history and exit")
+    parser.add_argument("--no-color", action="store_true", help="disable color output")
     args = parser.parse_args()
     if args.interval <= 0:
         parser.error("--interval must be greater than 0")
 
+    USE_COLOR = not args.no_color
+
     if args.doctor:
         raise SystemExit(doctor())
+    if args.clear_history:
+        history = HistoryStore()
+        history.clear()
+        print(f"Cleared history: {HISTORY_PATH}")
+        raise SystemExit(0)
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("shairport-tui needs an interactive terminal.", file=sys.stderr)
