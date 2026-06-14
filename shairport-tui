@@ -464,41 +464,87 @@ def draw_bar(win: curses.window, row: int, col: int, width: int, fraction: float
     add_line(win, row, col, "[" + "#" * fill + "-" * (width - fill) + "]")
 
 
-def section(win: curses.window, row: int, title: str, attr: int) -> int:
-    add_line(win, row, 0, title, attr)
-    return row + 1
-
-
-def draw_compact(stdscr: curses.window, snap: Snapshot, refresh_seconds: float, message: str) -> None:
-    stdscr.erase()
+def draw_header(stdscr: curses.window, view: str, refresh_seconds: float, message: str) -> None:
     _, width = stdscr.getmaxyx()
+    title_attr = curses.color_pair(1) | curses.A_BOLD
+    muted_attr = curses.A_DIM
+    warn_attr = curses.color_pair(4) | curses.A_BOLD
+    add_line(stdscr, 0, 0, "Shairport Sync", title_attr)
+    add_line(stdscr, 0, max(0, width - 22), dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), muted_attr)
+    add_line(stdscr, 1, 0, f"{view} | SPC play/pause | n/p | +/- vol | m mute | s stop | d debug | r | q", muted_attr)
+    add_line(stdscr, 2, 0, "-" * max(0, width - 1), muted_attr)
+    if message:
+        add_line(stdscr, 3, 0, message, warn_attr if message.startswith("error") else muted_attr)
+
+
+def draw_main(
+    stdscr: curses.window,
+    snap: Snapshot,
+    refresh_seconds: float,
+    message: str,
+) -> None:
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    title_attr = curses.color_pair(1) | curses.A_BOLD
     muted_attr = curses.A_DIM
     good_attr = curses.color_pair(3) | curses.A_BOLD
     warn_attr = curses.color_pair(4) | curses.A_BOLD
+
+    draw_header(stdscr, "main", refresh_seconds, message)
+
     if not snap.ok:
-        add_line(stdscr, 0, 0, f"Shairport Sync | error: {snap.error}", warn_attr)
+        add_line(stdscr, 5, 0, "Status", warn_attr)
+        add_line(stdscr, 6, 2, snap.error or "Unable to read Shairport Sync.", warn_attr)
+        add_line(stdscr, 8, 2, "Check shairport-sync and system D-Bus access.", muted_attr)
         stdscr.refresh()
         return
+
     connected = snap.available and snap.client
     status = "Connected" if connected else "Idle"
-    track = " - ".join(part for part in (snap.artist, snap.title) if part) or "-"
-    elapsed = format_seconds(snap.elapsed_seconds)
-    duration = format_seconds(snap.duration_seconds)
+    status_attr = good_attr if connected else muted_attr
+
     volume = "-"
     if snap.airplay_volume is not None:
         volume = f"{snap.airplay_volume:.1f} dB"
-    client = snap.client or "-"
-    if not connected and snap.client:
-        client = f"last {snap.client}"
-    line = f"{status} | {client} | {track} | {elapsed}/{duration} | {volume}"
-    add_line(stdscr, 0, 0, line, good_attr if connected else muted_attr)
-    add_line(stdscr, 1, 0, f"auto {refresh_seconds:g}s | SPC play/pause | n/p | +/- | r | c full | q", muted_attr)
-    if message:
-        add_line(stdscr, 2, max(0, width - len(message) - 1), message, warn_attr if message.startswith("error") else muted_attr)
+        if snap.volume_percent is not None:
+            volume += f" ({snap.volume_percent:.0f}%)"
+
+    client_label = "Client" if connected else "Last client"
+    add_line(stdscr, 4, 0, f"{status}", status_attr)
+    add_line(stdscr, 4, 14, f"{client_label}: {snap.client or '-'}", muted_attr, max_width=max(12, width - 44))
+    add_line(stdscr, 4, max(0, width - 28), f"Volume: {volume}", muted_attr)
+
+    add_line(stdscr, 6, 0, "Now Playing", title_attr)
+    add_line(stdscr, 8, 2, snap.title or "-", curses.A_BOLD)
+    add_line(stdscr, 9, 2, snap.artist or "-", title_attr)
+
+    album_line = snap.album or "-"
+    if snap.genre:
+        album_line = f"{album_line} | {snap.genre}"
+    add_line(stdscr, 10, 2, album_line, muted_attr)
+
+    estimated = " estimated" if snap.progress_estimated else ""
+    add_line(stdscr, 12, 2, f"{format_seconds(snap.elapsed_seconds)} / {format_seconds(snap.duration_seconds)}{estimated}", muted_attr)
+    fraction = None
+    if snap.elapsed_seconds is not None and snap.duration_seconds:
+        fraction = snap.elapsed_seconds / snap.duration_seconds
+    draw_bar(stdscr, 13, 2, max(8, width - 5), fraction)
+
+    row = 16
+    add_line(stdscr, row, 0, "Playback", title_attr)
+    row += 1
+    add_line(stdscr, row, 2, f"State: {snap.player_state}")
+    row += 1
+    add_line(stdscr, row, 2, f"Session active: {'yes' if snap.active else 'no'}")
+    row += 1
+    add_line(stdscr, row, 2, "Press d for debug: services, audio output, logs, and connection history.", muted_attr)
+
+    if height > 4:
+        add_line(stdscr, height - 1, 0, "Tip: use --doctor outside the TUI for a full environment check.", muted_attr)
     stdscr.refresh()
 
 
-def draw_full(
+def draw_debug(
     stdscr: curses.window,
     snap: Snapshot,
     system: SystemSnapshot,
@@ -513,127 +559,55 @@ def draw_full(
     good_attr = curses.color_pair(3) | curses.A_BOLD
     warn_attr = curses.color_pair(4) | curses.A_BOLD
 
-    add_line(stdscr, 0, 0, "Shairport Sync", title_attr)
-    add_line(stdscr, 0, max(0, width - 22), dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), muted_attr)
-    add_line(
-        stdscr,
-        1,
-        0,
-        f"auto {refresh_seconds:g}s | SPC play/pause | n/p | s stop | +/- vol | m mute | c | r | q",
-        muted_attr,
-    )
-    add_line(stdscr, 2, 0, "-" * max(0, width - 1), muted_attr)
-    if message:
-        add_line(stdscr, 3, 0, message, warn_attr if message.startswith("error") else muted_attr)
+    draw_header(stdscr, "debug", refresh_seconds, message)
+    add_line(stdscr, 3, max(0, width - 28), "d: back to main", muted_attr)
 
-    if not snap.ok:
-        add_line(stdscr, 5, 0, "Status", warn_attr)
-        add_line(stdscr, 6, 2, snap.error or "Unable to read Shairport Sync.", warn_attr)
-        add_line(stdscr, 8, 2, "Check shairport-sync and system D-Bus access.", muted_attr)
-        stdscr.refresh()
-        return
+    row = 5
+    add_line(stdscr, row, 0, "Service Health", title_attr)
+    row += 1
+    for unit in system.units:
+        state = f"{unit.active}/{unit.sub}"
+        attr = good_attr if unit.active == "active" else warn_attr
+        add_line(stdscr, row, 2, f"{unit.name}: {state} pid={unit.pid} restarts={unit.restarts}", attr)
+        row += 1
+        if unit.error:
+            add_line(stdscr, row, 4, unit.error, warn_attr)
+            row += 1
+    row += 1
 
-    left_width = max(38, width // 2 - 1)
-    right_col = left_width + 2
-    right_width = max(1, width - right_col - 1)
+    add_line(stdscr, row, 0, "Audio Output", title_attr)
+    row += 1
+    audio = system.audio
+    add_line(stdscr, row, 2, f"Backend: {audio.backend}   Output: {audio.output_device}   Mixer: {audio.mixer} {audio.alsa_volume}")
+    row += 1
+    add_line(stdscr, row, 2, f"Pulse: {audio.default_sink or audio.pulse_server or '-'}")
+    row += 1
+    for device in audio.devices[:3]:
+        add_line(stdscr, row, 2, device, muted_attr)
+        row += 1
+    for error in audio.errors[:2]:
+        add_line(stdscr, row, 2, error, warn_attr)
+        row += 1
+    row += 1
 
-    def left(row_num: int, col: int, text: Any, attr: int = 0) -> None:
-        add_line(stdscr, row_num, col, text, attr, max_width=max(1, left_width - col))
-
-    def right(row_num: int, text: Any, attr: int = 0, indent: int = 0) -> None:
-        add_line(stdscr, row_num, right_col + indent, text, attr, max_width=max(1, right_width - indent))
-
-    row = 4
-
-    connected = snap.available and snap.client
-    status = "Connected" if connected else "Idle"
-    status_attr = good_attr if connected else muted_attr
-    left(row, 0, "Connection", title_attr)
-    row += 1
-    left(row, 2, f"Status: {status}", status_attr)
-    row += 1
-    left(row, 2, f"{'Client' if connected else 'Last client'}: {snap.client or '-'}")
-    row += 1
-    left(row, 2, f"Session active: {'yes' if snap.active else 'no'}")
-    row += 1
-    left(row, 2, f"Player state: {snap.player_state}")
-    row += 1
-    volume = "-"
-    if snap.airplay_volume is not None:
-        volume = f"{snap.airplay_volume:.1f} dB"
-        if snap.volume_percent is not None:
-            volume += f" ({snap.volume_percent:.0f}%)"
-    left(row, 2, f"AirPlay volume: {volume}")
-    row += 2
-
-    left(row, 0, "Now Playing", title_attr)
-    row += 1
-    left(row, 2, f"Title:  {snap.title or '-'}")
-    row += 1
-    left(row, 2, f"Artist: {snap.artist or '-'}")
-    row += 1
-    left(row, 2, f"Album:  {snap.album or '-'}")
-    row += 1
-    left(row, 2, f"Genre:  {snap.genre or '-'}")
-    row += 2
-
-    left(row, 0, "Progress", title_attr)
-    row += 1
-    estimated = " estimated" if snap.progress_estimated else ""
-    left(row, 2, f"{format_seconds(snap.elapsed_seconds)} / {format_seconds(snap.duration_seconds)}{estimated}")
-    row += 1
-    fraction = None
-    if snap.elapsed_seconds is not None and snap.duration_seconds:
-        fraction = snap.elapsed_seconds / snap.duration_seconds
-    draw_bar(stdscr, row, 2, min(left_width - 5, width - 5), fraction)
-    row += 2
-
-    left(row, 0, "Connection History", title_attr)
+    add_line(stdscr, row, 0, "Connection History", title_attr)
     row += 1
     if history.items:
-        for item in history.items[: max(1, min(4, height - row - 1))]:
+        for item in history.items[: max(1, min(5, height - row - 8))]:
             track = item.get("last_track", "-")
-            left(row, 2, f"{item.get('client', '-')} | {item.get('last_state', '-')} | {track}")
+            add_line(stdscr, row, 2, f"{item.get('client', '-')} | {item.get('last_state', '-')} | {track}")
             row += 1
     else:
-        left(row, 2, "No history yet.", muted_attr)
+        add_line(stdscr, row, 2, "No history yet.", muted_attr)
+        row += 1
+    row += 1
 
-    row = 4
-    if right_col < width - 20:
-        right(row, "Service Health", title_attr)
+    add_line(stdscr, row, 0, "Recent Logs", title_attr)
+    row += 1
+    remaining = max(0, height - row - 2)
+    for line in system.logs[-remaining:]:
+        add_line(stdscr, row, 2, line, muted_attr)
         row += 1
-        for unit in system.units:
-            state = f"{unit.active}/{unit.sub}"
-            attr = good_attr if unit.active == "active" else warn_attr
-            right(row, f"{unit.name}: {state} pid={unit.pid} restarts={unit.restarts}", attr)
-            row += 1
-            if unit.error:
-                right(row, unit.error, warn_attr, indent=2)
-                row += 1
-        row += 1
-
-        right(row, "Audio Output", title_attr)
-        row += 1
-        audio = system.audio
-        right(row, f"Backend: {audio.backend}")
-        row += 1
-        right(row, f"Output:  {audio.output_device}")
-        row += 1
-        right(row, f"Mixer:   {audio.mixer} {audio.alsa_volume}")
-        row += 1
-        right(row, f"Pulse:   {audio.default_sink or audio.pulse_server or '-'}")
-        row += 1
-        for device in audio.devices[:2]:
-            right(row, device, muted_attr)
-            row += 1
-        row += 1
-
-        right(row, "Recent Logs", title_attr)
-        row += 1
-        remaining = max(0, height - row - 1)
-        for line in system.logs[-remaining:]:
-            right(row, line, muted_attr)
-            row += 1
 
     if height > 4:
         add_line(stdscr, height - 1, 0, f"Build: {snap.version or '-'}", muted_attr)
@@ -649,15 +623,13 @@ def read_snapshot(reader: ShairportReader | None) -> tuple[ShairportReader | Non
         return None, Snapshot(ok=False, error=str(exc))
 
 
-def handle_key(key: int, reader: ShairportReader | None) -> tuple[str | None, bool, bool]:
+def handle_key(key: int, reader: ShairportReader | None) -> tuple[str | None, bool]:
     if key in (ord("q"), ord("Q"), 27):
-        return None, True, False
-    if key in (ord("c"), ord("C")):
-        return "toggle compact", False, True
+        return None, True
     if key < 0:
-        return None, False, False
+        return None, False
     if reader is None:
-        return "error: Shairport D-Bus unavailable", False, False
+        return "error: Shairport D-Bus unavailable", False
     mapping = {
         ord(" "): "toggle",
         ord("n"): "next",
@@ -675,15 +647,15 @@ def handle_key(key: int, reader: ShairportReader | None) -> tuple[str | None, bo
     }
     action = mapping.get(key)
     if not action:
-        return None, False, False
+        return None, False
     try:
         method = reader.command(action)
     except Exception as exc:
-        return f"error: {exc}", False, False
-    return f"sent {method}", False, False
+        return f"error: {exc}", False
+    return f"sent {method}", False
 
 
-def run(stdscr: curses.window, refresh_seconds: float, compact: bool) -> None:
+def run(stdscr: curses.window, refresh_seconds: float) -> None:
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_CYAN, -1)
     curses.init_pair(3, curses.COLOR_GREEN, -1)
@@ -701,6 +673,7 @@ def run(stdscr: curses.window, refresh_seconds: float, compact: bool) -> None:
     next_refresh = 0.0
     message = ""
     message_until = 0.0
+    view = "main"
 
     while True:
         now = time.monotonic()
@@ -712,10 +685,10 @@ def run(stdscr: curses.window, refresh_seconds: float, compact: bool) -> None:
             system = system_reader.read()
             if now >= message_until:
                 message = ""
-            if compact or stdscr.getmaxyx()[0] < 18 or stdscr.getmaxyx()[1] < 72:
-                draw_compact(stdscr, snap, refresh_seconds, message)
+            if view == "debug":
+                draw_debug(stdscr, snap, system, history, refresh_seconds, message)
             else:
-                draw_full(stdscr, snap, system, history, refresh_seconds, message)
+                draw_main(stdscr, snap, refresh_seconds, message)
             next_refresh = now + refresh_seconds
 
         key = stdscr.getch()
@@ -723,12 +696,13 @@ def run(stdscr: curses.window, refresh_seconds: float, compact: bool) -> None:
             next_refresh = 0.0
             system = system_reader.read(force=True)
             continue
-        new_message, should_quit, toggle_compact = handle_key(key, reader)
+        if key in (ord("d"), ord("D")):
+            view = "debug" if view == "main" else "main"
+            next_refresh = 0.0
+            continue
+        new_message, should_quit = handle_key(key, reader)
         if should_quit:
             return
-        if toggle_compact:
-            compact = not compact
-            next_refresh = 0.0
         if new_message:
             message = new_message
             message_until = time.monotonic() + 2.5
@@ -801,7 +775,6 @@ def main() -> None:
         default=DEFAULT_REFRESH_SECONDS,
         help=f"auto-refresh interval in seconds (default: {DEFAULT_REFRESH_SECONDS:g})",
     )
-    parser.add_argument("--compact", action="store_true", help="start in compact one-line mode")
     parser.add_argument("--doctor", action="store_true", help="run diagnostics and exit")
     args = parser.parse_args()
     if args.interval <= 0:
@@ -814,7 +787,7 @@ def main() -> None:
         print("shairport-tui needs an interactive terminal.", file=sys.stderr)
         raise SystemExit(2)
     signal.signal(signal.SIGINT, lambda _signum, _frame: raise_keyboard_interrupt())
-    curses.wrapper(run, args.interval, args.compact)
+    curses.wrapper(run, args.interval)
 
 
 def raise_keyboard_interrupt() -> None:

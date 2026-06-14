@@ -15,12 +15,15 @@ Sync's D-Bus remote-control interface.
 - Local progress estimation for Shairport Sync builds where `ProgressString`
   does not update continuously.
 - Playback controls: play/pause, next, previous, stop, mute, and volume.
+- Clean main playback screen with status, client, now-playing metadata,
+  progress, volume, and controls.
+- Debug screen, opened with `d`, for service health, audio output, connection
+  history, and recent logs.
 - Service health for `shairport-sync.service` and `avahi-daemon.service`.
-- Audio output panel for configured backend, ALSA device, mixer, Pulse sink,
+- Audio output details for configured backend, ALSA device, mixer, Pulse sink,
   ALSA volume, and detected playback devices.
-- Recent `journalctl` log panel.
+- Recent `journalctl` logs in the debug screen.
 - Persistent connection history in `~/.cache/shairport-tui/history.json`.
-- Compact one-line mode for small terminals.
 - `--doctor` diagnostics for dependencies, services, D-Bus, logs, and audio.
 
 ## Requirements
@@ -74,12 +77,6 @@ Start the full dashboard:
 shairport-tui
 ```
 
-Start in compact mode:
-
-```bash
-shairport-tui --compact
-```
-
 Change the auto-refresh interval:
 
 ```bash
@@ -104,8 +101,17 @@ shairport-tui --doctor
 | `-` or `_` | Volume down |
 | `m` | Toggle mute |
 | `r` | Refresh now |
-| `c` | Toggle compact/full view |
+| `d` | Toggle debug view |
 | `q` or `Esc` | Quit |
+
+## Views
+
+The main screen is intentionally focused on playback: connection state,
+current client, track metadata, volume, progress, and the most useful controls.
+
+Press `d` to open the debug screen. Debug contains the noisier operational
+details: systemd health, audio output configuration, ALSA/Pulse state,
+connection history, and recent Shairport Sync logs.
 
 ## Notes
 
