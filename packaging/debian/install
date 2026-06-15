@@ -1,0 +1,4 @@
+shairport-tui usr/bin/
+docs/shairport-tui.1 usr/share/man/man1/
+completions/shairport-tui.bash usr/share/bash-completion/completions/shairport-tui
+completions/_shairport-tui usr/share/zsh/vendor-completions/

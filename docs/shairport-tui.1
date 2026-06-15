@@ -1,0 +1,88 @@
+.TH SHAIRPORT-TUI 1 "June 2026" "shairport-tui 0.3.0" "User Commands"
+.SH NAME
+shairport-tui \- terminal dashboard and control surface for Shairport Sync
+.SH SYNOPSIS
+.B shairport-tui
+[\fB--interval\fR \fISECONDS\fR]
+[\fB--config\fR \fIFILE\fR]
+[\fB--no-color\fR]
+.br
+.B shairport-tui
+\fB--doctor\fR
+.br
+.B shairport-tui
+\fB--clear-history\fR
+.SH DESCRIPTION
+.B shairport-tui
+shows Shairport Sync AirPlay receiver status, now-playing metadata, estimated
+progress, volume, client information, service health, audio output details,
+recent logs, and connection history.
+.PP
+The main view focuses on playback. Press
+.B d
+to open the debug view for service, audio, history, and log details.
+.SH OPTIONS
+.TP
+.BR -i ", " --interval " " \fISECONDS\fR
+Set the automatic refresh interval.
+.TP
+.BR --doctor
+Check D-Bus, Shairport Sync, systemd services, journal access, and audio state.
+.TP
+.BR --clear-history
+Delete saved connection history and exit.
+.TP
+.BR --config " " \fIFILE\fR
+Read configuration from a JSON file.
+.TP
+.BR --write-config
+Write a default configuration file and exit.
+.TP
+.BR --no-color
+Disable color output.
+.TP
+.BR --version
+Print the version and exit.
+.SH KEYS
+.TP
+.B Space
+Play or pause.
+.TP
+.B n / p
+Next or previous track.
+.TP
+.B + / -
+Volume up or down.
+.TP
+.B m
+Toggle mute.
+.TP
+.B s
+Stop playback.
+.TP
+.B d
+Toggle main and debug views.
+.TP
+.B 0-4
+Filter debug view: all, services, audio, history, logs.
+.TP
+.B j/k, arrows, f/b, g/G
+Scroll the debug view.
+.TP
+.B C
+Clear connection history after confirmation.
+.TP
+.B ? or h
+Show help.
+.TP
+.B q or Esc
+Quit.
+.SH FILES
+.TP
+.I ~/.config/shairport-tui/config.json
+Optional configuration.
+.TP
+.I ~/.cache/shairport-tui/history.json
+Connection history.
+.SH AUTHOR
+Oscar Tian

@@ -1,0 +1,19 @@
+Shairport Sync                                      2026-06-15 09:30:00
+main | SPC play | n/p | +/- | m mute | s stop | d debug | ? help | r | q
+-------------------------------------------------------------------------------
+[CONNECTED]   Client: 192.168.1.23 (iphone.local)       Volume: -16.2 dB (46%)
+
+Now Playing
+
+  Smile
+  Jay Chou & Cindy Yen
+  Opus 12 | Mandopop
+  Artwork: file:///tmp/shairport-sync/.cache/coverart/cover-example.jpg
+
+  2:24 / 4:49 estimated
+  [#####################################--------------------------------------]
+
+Playback
+  State: [PLAYING]
+  Session active: yes
+  Press d for debug: services, audio output, logs, and connection history.

@@ -1,0 +1,11 @@
+#compdef shairport-tui
+
+_arguments \
+  '(-h --help)'{-h,--help}'[show help]' \
+  '--version[show version]' \
+  '(-i --interval)'{-i,--interval}'[auto-refresh interval in seconds]:seconds:' \
+  '--doctor[run diagnostics and exit]' \
+  '--clear-history[delete saved connection history and exit]' \
+  '--config[path to config JSON]:file:_files' \
+  '--write-config[write a default config file and exit]' \
+  '--no-color[disable color output]'

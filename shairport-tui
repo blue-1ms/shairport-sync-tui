@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -20,6 +21,7 @@ except ImportError:  # pragma: no cover - depends on host packages
     dbus = None
 
 
+VERSION = "0.3.0"
 SERVICE = "org.gnome.ShairportSync"
 OBJECT = "/org/gnome/ShairportSync"
 PROPS = "org.freedesktop.DBus.Properties"
@@ -30,9 +32,19 @@ DEFAULT_REFRESH_SECONDS = 1.0
 SYSTEM_REFRESH_SECONDS = 5.0
 SAMPLE_RATE = 44_100
 CONFIG_PATH = Path("/etc/shairport-sync.conf")
+APP_CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "shairport-tui" / "config.json"
 HISTORY_PATH = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "shairport-tui" / "history.json"
 HISTORY_LIMIT = 12
+LOG_LINES = 80
 USE_COLOR = True
+
+DEFAULT_APP_CONFIG = {
+    "refresh_interval": DEFAULT_REFRESH_SECONDS,
+    "color": True,
+    "default_view": "main",
+    "history_limit": HISTORY_LIMIT,
+    "log_lines": LOG_LINES,
+}
 
 
 @dataclass
@@ -43,6 +55,7 @@ class Snapshot:
     available: bool = False
     player_state: str = "Unknown"
     client: str = ""
+    client_name: str = ""
     airplay_volume: float | None = None
     volume_percent: float | None = None
     title: str = ""
@@ -160,6 +173,65 @@ def format_seconds(seconds: float | None) -> str:
     return f"{minutes:d}:{seconds:02d}"
 
 
+def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
+def clamp_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
+def load_app_config() -> dict[str, Any]:
+    return load_app_config_from(APP_CONFIG_PATH)
+
+
+def load_app_config_from(path: Path) -> dict[str, Any]:
+    config = dict(DEFAULT_APP_CONFIG)
+    try:
+        loaded = json.loads(path.read_text())
+    except FileNotFoundError:
+        loaded = {}
+    except Exception:
+        loaded = {}
+    if isinstance(loaded, dict):
+        config.update(loaded)
+    config["refresh_interval"] = clamp_float(config.get("refresh_interval"), DEFAULT_REFRESH_SECONDS, 0.1, 60.0)
+    config["color"] = bool(config.get("color"))
+    if config.get("default_view") not in ("main", "debug"):
+        config["default_view"] = "main"
+    config["history_limit"] = clamp_int(config.get("history_limit"), HISTORY_LIMIT, 1, 200)
+    config["log_lines"] = clamp_int(config.get("log_lines"), LOG_LINES, 1, 500)
+    return config
+
+
+def write_default_config(path: Path = APP_CONFIG_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(DEFAULT_APP_CONFIG, indent=2, sort_keys=True) + "\n")
+
+
+def status_badge(text: str) -> str:
+    value = (text or "unknown").upper()
+    return f"[{value}]"
+
+
+def resolve_hostname(address: str) -> str:
+    if not address:
+        return ""
+    try:
+        host, _, _aliases = socket.gethostbyaddr(address)
+    except Exception:
+        return ""
+    return host.rstrip(".")
+
+
 def run_cmd(args: list[str], timeout: float = 2.0) -> tuple[bool, str]:
     if not shutil.which(args[0]):
         return False, f"{args[0]} not found"
@@ -203,12 +275,14 @@ class ShairportReader:
             # AirPlay reports 0 dB as full scale and -30 dB as silence-ish.
             volume_percent = max(0.0, min(100.0, (30.0 + airplay_volume) / 30.0 * 100.0))
 
+        client = as_text(remote.get("Client"))
         return Snapshot(
             ok=True,
             active=as_bool(core.get("Active")),
             available=as_bool(remote.get("Available")),
             player_state=as_text(remote.get("PlayerState")) or "Unknown",
-            client=as_text(remote.get("Client")),
+            client=client,
+            client_name=resolve_hostname(client),
             airplay_volume=airplay_volume,
             volume_percent=volume_percent,
             title=as_text(metadata.get("xesam:title")),
@@ -325,6 +399,8 @@ class HistoryStore:
             self.items.insert(0, existing)
         existing["last_seen"] = now
         existing["last_state"] = snap.player_state
+        if snap.client_name:
+            existing["client_name"] = snap.client_name
         if track:
             existing["last_track"] = track
         del self.items[HISTORY_LIMIT:]
@@ -419,12 +495,12 @@ def read_audio() -> AudioStatus:
 
 def read_logs() -> list[str]:
     ok, output = run_cmd(
-        ["journalctl", "-u", "shairport-sync.service", "-n", "80", "--no-pager", "--output=short-iso"],
+        ["journalctl", "-u", "shairport-sync.service", "-n", str(LOG_LINES), "--no-pager", "--output=short-iso"],
         timeout=4.0,
     )
     if not ok:
         return [output]
-    return [line for line in output.splitlines() if line.strip()][-80:]
+    return [line for line in output.splitlines() if line.strip()][-LOG_LINES:]
 
 
 class SystemReader:
@@ -515,7 +591,7 @@ def draw_main(
         return
 
     connected = snap.available and snap.client
-    status = "Connected" if connected else "Idle"
+    status = "connected" if connected else "idle"
     status_attr = good_attr if connected else muted_attr
 
     volume = "-"
@@ -525,8 +601,11 @@ def draw_main(
             volume += f" ({snap.volume_percent:.0f}%)"
 
     client_label = "Client" if connected else "Last client"
-    add_line(stdscr, 4, 0, f"{status}", status_attr)
-    add_line(stdscr, 4, 14, f"{client_label}: {snap.client or '-'}", muted_attr, max_width=max(12, width - 44))
+    client_value = snap.client or "-"
+    if snap.client_name:
+        client_value = f"{client_value} ({snap.client_name})"
+    add_line(stdscr, 4, 0, status_badge(status), status_attr)
+    add_line(stdscr, 4, 14, f"{client_label}: {client_value}", muted_attr, max_width=max(12, width - 44))
     add_line(stdscr, 4, max(0, width - 28), f"Volume: {volume}", muted_attr)
 
     add_line(stdscr, 6, 0, "Now Playing", title_attr)
@@ -537,6 +616,8 @@ def draw_main(
     if snap.genre:
         album_line = f"{album_line} | {snap.genre}"
     add_line(stdscr, 10, 2, album_line, muted_attr)
+    if snap.art_url:
+        add_line(stdscr, 11, 2, f"Artwork: {snap.art_url}", muted_attr)
 
     estimated = " estimated" if snap.progress_estimated else ""
     add_line(stdscr, 12, 2, f"{format_seconds(snap.elapsed_seconds)} / {format_seconds(snap.duration_seconds)}{estimated}", muted_attr)
@@ -548,7 +629,7 @@ def draw_main(
     row = 16
     add_line(stdscr, row, 0, "Playback", title_attr)
     row += 1
-    add_line(stdscr, row, 2, f"State: {snap.player_state}")
+    add_line(stdscr, row, 2, f"State: {status_badge(snap.player_state)}")
     row += 1
     add_line(stdscr, row, 2, f"Session active: {'yes' if snap.active else 'no'}")
     row += 1
@@ -567,6 +648,7 @@ def draw_debug(
     refresh_seconds: float,
     message: str,
     scroll: int,
+    section_filter: str,
 ) -> int:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
@@ -576,40 +658,51 @@ def draw_debug(
     warn_attr = pair(4) | curses.A_BOLD
 
     draw_header(stdscr, "debug", refresh_seconds, message)
-    add_line(stdscr, 3, max(0, width - 40), "d: main | j/k or arrows scroll", muted_attr)
+    add_line(stdscr, 3, max(0, width - 54), f"filter: {section_filter} | 0 all 1 svc 2 audio 3 hist 4 logs", muted_attr)
 
     rows: list[tuple[int, Any, int]] = []
-    rows.append((0, "Service Health", title_attr))
-    for unit in system.units:
-        state = f"{unit.active}/{unit.sub}"
-        attr = good_attr if unit.active == "active" else warn_attr
-        rows.append((2, f"{unit.name}: {state} pid={unit.pid} restarts={unit.restarts}", attr))
-        if unit.error:
-            rows.append((4, unit.error, warn_attr))
-    rows.append((0, "", 0))
+    if section_filter in ("all", "services"):
+        rows.append((0, "Service Health", title_attr))
+        for unit in system.units:
+            state = f"{unit.active}/{unit.sub}"
+            attr = good_attr if unit.active == "active" else warn_attr
+            rows.append((2, f"{unit.name}: {state} pid={unit.pid} restarts={unit.restarts}", attr))
+            if unit.error:
+                rows.append((4, unit.error, warn_attr))
+        rows.append((0, "", 0))
 
-    audio = system.audio
-    rows.append((0, "Audio Output", title_attr))
-    rows.append((2, f"Backend: {audio.backend}   Output: {audio.output_device}   Mixer: {audio.mixer} {audio.alsa_volume}", 0))
-    rows.append((2, f"Pulse: {audio.default_sink or audio.pulse_server or '-'}", 0))
-    for device in audio.devices[:3]:
-        rows.append((2, device, muted_attr))
-    for error in audio.errors[:2]:
-        rows.append((2, error, warn_attr))
-    rows.append((0, "", 0))
+    if section_filter in ("all", "audio"):
+        audio = system.audio
+        rows.append((0, "Audio Output", title_attr))
+        rows.append((2, f"Backend: {audio.backend}   Output: {audio.output_device}   Mixer: {audio.mixer} {audio.alsa_volume}", 0))
+        rows.append((2, f"Pulse: {audio.default_sink or audio.pulse_server or '-'}", 0))
+        for device in audio.devices[:3]:
+            rows.append((2, device, muted_attr))
+        for error in audio.errors[:2]:
+            rows.append((2, error, warn_attr))
+        rows.append((0, "", 0))
 
-    rows.append((0, "Connection History", title_attr))
-    if history.items:
-        for item in history.items:
-            track = item.get("last_track", "-")
-            rows.append((2, f"{item.get('client', '-')} | {item.get('last_state', '-')} | {track}", 0))
-    else:
-        rows.append((2, "No history yet.", muted_attr))
-    rows.append((0, "", 0))
+    if section_filter in ("all", "history"):
+        rows.append((0, "Connection History", title_attr))
+        if history.items:
+            for item in history.items:
+                track = item.get("last_track", "-")
+                name = item.get("client_name", "")
+                client = item.get("client", "-")
+                if name:
+                    client = f"{client} ({name})"
+                rows.append((2, f"{client} | {item.get('last_state', '-')} | {track}", 0))
+        else:
+            rows.append((2, "No history yet.", muted_attr))
+        rows.append((0, "", 0))
 
-    rows.append((0, "Recent Logs", title_attr))
-    for line in system.logs:
-        rows.append((2, line, muted_attr))
+    if section_filter in ("all", "logs"):
+        rows.append((0, "Recent Logs", title_attr))
+        for line in system.logs:
+            rows.append((2, line, muted_attr))
+
+    if not rows:
+        rows.append((0, "No debug rows for this filter.", muted_attr))
 
     start_row = 5
     available = max(1, height - start_row - 1)
@@ -638,14 +731,17 @@ def draw_help(stdscr: curses.window, refresh_seconds: float, message: str) -> No
         ("  m           Toggle mute", 0),
         ("  s           Stop playback", 0),
         ("  d           Toggle main/debug view", 0),
+        ("  0-4         Debug filters: all/services/audio/history/logs", 0),
         ("  r           Refresh now", 0),
         ("  j/k, arrows Scroll debug view", 0),
+        ("  C           Clear connection history, with confirmation", 0),
         ("  ? or h      Toggle this help", 0),
         ("  q or Esc    Quit", 0),
         ("", 0),
         ("Commands", title_attr),
         ("  shairport-tui --doctor         Check services, D-Bus, logs, and audio", 0),
         ("  shairport-tui --clear-history  Delete saved connection history", 0),
+        ("  shairport-tui --write-config   Write a default config file", 0),
         ("  shairport-tui --no-color       Disable color output", 0),
         ("", 0),
         ("Press ? or h to return.", muted_attr),
@@ -705,7 +801,7 @@ def handle_key(key: int, reader: ShairportReader | None) -> tuple[str | None, bo
     return f"sent {labels.get(method, method)}", False
 
 
-def run(stdscr: curses.window, refresh_seconds: float) -> None:
+def run(stdscr: curses.window, refresh_seconds: float, default_view: str) -> None:
     global USE_COLOR
     USE_COLOR = USE_COLOR and curses.has_colors()
     if USE_COLOR and curses.has_colors():
@@ -727,10 +823,13 @@ def run(stdscr: curses.window, refresh_seconds: float) -> None:
     next_refresh = 0.0
     message = ""
     message_until = 0.0
-    view = "main"
-    previous_view = "main"
+    view = default_view if default_view in ("main", "debug") else "main"
+    previous_view = view
     debug_scroll = 0
     debug_max_scroll = 0
+    debug_filter = "all"
+    clear_confirm_until = 0.0
+    history_pause_until = 0.0
 
     while True:
         now = time.monotonic()
@@ -738,14 +837,15 @@ def run(stdscr: curses.window, refresh_seconds: float) -> None:
             reader, snap = read_snapshot(reader)
             if snap.ok:
                 snap = progress_clock.apply(snap)
-                history.record(snap)
+                if now >= history_pause_until:
+                    history.record(snap)
             system = system_reader.read()
             if now >= message_until:
                 message = ""
             if view == "help":
                 draw_help(stdscr, refresh_seconds, message)
             elif view == "debug":
-                debug_max_scroll = draw_debug(stdscr, snap, system, history, refresh_seconds, message, debug_scroll)
+                debug_max_scroll = draw_debug(stdscr, snap, system, history, refresh_seconds, message, debug_scroll, debug_filter)
                 debug_scroll = min(debug_scroll, debug_max_scroll)
             else:
                 draw_main(stdscr, snap, refresh_seconds, message)
@@ -771,7 +871,32 @@ def run(stdscr: curses.window, refresh_seconds: float) -> None:
                 view = "debug" if view == "main" else "main"
             next_refresh = 0.0
             continue
+        if key == ord("C"):
+            if time.monotonic() <= clear_confirm_until:
+                history.clear()
+                message = "connection history cleared"
+                message_until = time.monotonic() + 2.5
+                clear_confirm_until = 0.0
+                history_pause_until = time.monotonic() + 5.0
+            else:
+                message = "press C again to clear connection history"
+                message_until = time.monotonic() + 4.0
+                clear_confirm_until = time.monotonic() + 4.0
+            next_refresh = 0.0
+            continue
         if view == "debug":
+            filters = {
+                ord("0"): "all",
+                ord("1"): "services",
+                ord("2"): "audio",
+                ord("3"): "history",
+                ord("4"): "logs",
+            }
+            if key in filters:
+                debug_filter = filters[key]
+                debug_scroll = 0
+                next_refresh = 0.0
+                continue
             page = max(1, stdscr.getmaxyx()[0] - 7)
             if key in (ord("j"), curses.KEY_DOWN):
                 debug_scroll = min(debug_scroll + 1, debug_max_scroll)
@@ -864,23 +989,37 @@ def doctor() -> int:
 
 
 def main() -> None:
-    global USE_COLOR
+    global HISTORY_LIMIT, LOG_LINES, USE_COLOR
     parser = argparse.ArgumentParser(description="Terminal dashboard for Shairport Sync.")
+    parser.add_argument("--version", action="version", version=f"shairport-tui {VERSION}")
     parser.add_argument(
         "-i",
         "--interval",
         type=float,
-        default=DEFAULT_REFRESH_SECONDS,
-        help=f"auto-refresh interval in seconds (default: {DEFAULT_REFRESH_SECONDS:g})",
+        default=None,
+        help=f"auto-refresh interval in seconds (default: config or {DEFAULT_REFRESH_SECONDS:g})",
     )
     parser.add_argument("--doctor", action="store_true", help="run diagnostics and exit")
     parser.add_argument("--clear-history", action="store_true", help="delete saved connection history and exit")
+    parser.add_argument("--config", default=str(APP_CONFIG_PATH), help="path to config JSON")
+    parser.add_argument("--write-config", action="store_true", help="write a default config file and exit")
     parser.add_argument("--no-color", action="store_true", help="disable color output")
     args = parser.parse_args()
-    if args.interval <= 0:
+
+    config_path = Path(args.config).expanduser()
+    if args.write_config:
+        write_default_config(config_path)
+        print(f"Wrote config: {config_path}")
+        raise SystemExit(0)
+
+    config = load_app_config() if config_path == APP_CONFIG_PATH else load_app_config_from(config_path)
+    refresh_seconds = args.interval if args.interval is not None else float(config["refresh_interval"])
+    if refresh_seconds <= 0:
         parser.error("--interval must be greater than 0")
 
-    USE_COLOR = not args.no_color
+    HISTORY_LIMIT = int(config["history_limit"])
+    LOG_LINES = int(config["log_lines"])
+    USE_COLOR = bool(config["color"]) and not args.no_color
 
     if args.doctor:
         raise SystemExit(doctor())
@@ -894,7 +1033,7 @@ def main() -> None:
         print("shairport-tui needs an interactive terminal.", file=sys.stderr)
         raise SystemExit(2)
     signal.signal(signal.SIGINT, lambda _signum, _frame: raise_keyboard_interrupt())
-    curses.wrapper(run, args.interval)
+    curses.wrapper(run, refresh_seconds, str(config["default_view"]))
 
 
 def raise_keyboard_interrupt() -> None:

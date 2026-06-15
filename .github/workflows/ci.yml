@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Syntax and CLI checks
+        run: make check
+      - name: Validate completions and docs exist
+        run: |
+          test -x shairport-tui
+          test -f completions/shairport-tui.bash
+          test -f completions/_shairport-tui
+          test -f docs/shairport-tui.1
+          test -f docs/raspberry-pi.md
+          test -f docs/demo.txt
+          test -f docs/demo.svg

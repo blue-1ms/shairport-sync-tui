@@ -8,6 +8,8 @@ estimated song progress, service health, audio output state, recent logs, and
 connection history. It can also send basic playback controls over Shairport
 Sync's D-Bus remote-control interface.
 
+![shairport-tui demo](docs/demo.svg)
+
 ## Features
 
 - Live Shairport Sync status from the system D-Bus.
@@ -26,9 +28,14 @@ Sync's D-Bus remote-control interface.
 - Persistent connection history in `~/.cache/shairport-tui/history.json`.
 - Scrollable debug view for longer logs and history.
 - In-app help overlay with `?`.
+- Debug filters for services, audio, history, and logs.
+- Client hostname lookup when the OS can resolve the AirPlay source address.
+- Artwork path hints when Shairport Sync exposes cover art.
+- Config file support at `~/.config/shairport-tui/config.json`.
 - `--doctor` diagnostics for dependencies, services, D-Bus, logs, and audio.
 - `--clear-history` for deleting saved connection history.
 - `--no-color` for plain terminal output.
+- Bash and zsh completions, a man page, CI, and Debian packaging metadata.
 
 ## Requirements
 
@@ -67,7 +74,7 @@ cd shairport-sync-tui
 install -Dm755 shairport-tui ~/.local/bin/shairport-tui
 ```
 
-Or use `make`:
+Or use `make`, which also installs the man page and shell completions:
 
 ```bash
 make install
@@ -111,6 +118,18 @@ Disable color output:
 shairport-tui --no-color
 ```
 
+Write a default config:
+
+```bash
+shairport-tui --write-config
+```
+
+Use an alternate config:
+
+```bash
+shairport-tui --config ./config.json
+```
+
 ## Controls
 
 | Key | Action |
@@ -124,10 +143,16 @@ shairport-tui --no-color
 | `m` | Toggle mute |
 | `r` | Refresh now |
 | `d` | Toggle debug view |
+| `0` | Show all debug sections |
+| `1` | Show service health only |
+| `2` | Show audio output only |
+| `3` | Show connection history only |
+| `4` | Show recent logs only |
 | `?` or `h` | Toggle help |
 | `j` / `k` or arrows | Scroll debug view |
 | `f` / `b` or Page Down / Page Up | Page debug view |
 | `g` / `G` or Home / End | Jump debug view to top / bottom |
+| `C` | Clear connection history after confirmation |
 | `q` or `Esc` | Quit |
 
 ## Views
@@ -138,6 +163,45 @@ current client, track metadata, volume, progress, and the most useful controls.
 Press `d` to open the debug screen. Debug contains the noisier operational
 details: systemd health, audio output configuration, ALSA/Pulse state,
 connection history, and recent Shairport Sync logs.
+
+Use `0` through `4` in debug to filter the debug sections.
+
+## Configuration
+
+Generate a default config:
+
+```bash
+shairport-tui --write-config
+```
+
+Default location:
+
+```text
+~/.config/shairport-tui/config.json
+```
+
+Example:
+
+```json
+{
+  "color": true,
+  "default_view": "main",
+  "history_limit": 12,
+  "log_lines": 80,
+  "refresh_interval": 1.0
+}
+```
+
+CLI flags override the config where both apply.
+
+## Extra Files
+
+- `docs/shairport-tui.1`: man page.
+- `docs/raspberry-pi.md`: Raspberry Pi setup notes.
+- `docs/demo.svg` and `docs/demo.txt`: visual and text demos of the main screen.
+- `completions/`: bash and zsh completions.
+- `packaging/debian/`: lightweight Debian packaging metadata.
+- `.github/workflows/ci.yml`: syntax and CLI checks.
 
 ## Notes
 
