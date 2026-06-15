@@ -30,7 +30,9 @@ Sync's D-Bus remote-control interface.
 - In-app help overlay with `?`.
 - Debug filters for services, audio, history, and logs.
 - Client hostname lookup when the OS can resolve the AirPlay source address.
-- Artwork path hints in debug when Shairport Sync exposes cover art.
+- Borderless main-screen cover artwork when Shairport Sync exposes cover art
+  and the terminal supports inline images.
+- Artwork path hints in debug.
 - Config file support at `~/.config/shairport-tui/config.json`.
 - `--doctor` diagnostics for dependencies, services, D-Bus, logs, and audio.
 - `--clear-history` for deleting saved connection history.
@@ -49,11 +51,12 @@ Sync's D-Bus remote-control interface.
   - `pactl`
   - `amixer`
   - `aplay`
+  - `chafa` for inline cover artwork
 
 On Debian or Ubuntu-style systems:
 
 ```bash
-sudo apt install python3-dbus
+sudo apt install python3-dbus chafa
 ```
 
 Shairport Sync should report build features similar to:
@@ -160,6 +163,8 @@ shairport-tui --config ./config.json
 
 The main screen is intentionally focused on playback: connection state,
 current client, track metadata, volume, progress, and the most useful controls.
+On terminals with Sixel, Kitty graphics, or iTerm inline image support, the
+right side can show borderless cover artwork using `chafa`.
 
 Press `d` to open the debug screen. Debug contains the noisier operational
 details: systemd health, audio output configuration, ALSA/Pulse state,

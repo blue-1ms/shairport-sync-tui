@@ -21,13 +21,20 @@ recent logs, and connection history.
 The main view focuses on playback. Press
 .B d
 to open the debug view for service, audio, history, and log details.
+.PP
+When Shairport Sync exposes cover art and the terminal supports Sixel, Kitty
+graphics, or iTerm inline images,
+.B shairport-tui
+can show borderless cover artwork using
+.B chafa.
 .SH OPTIONS
 .TP
 .BR -i ", " --interval " " \fISECONDS\fR
 Set the automatic refresh interval.
 .TP
 .BR --doctor
-Check D-Bus, Shairport Sync, systemd services, journal access, and audio state.
+Check D-Bus, Shairport Sync, systemd services, journal access, audio state, and
+optional inline artwork support.
 .TP
 .BR --clear-history
 Delete saved connection history and exit.

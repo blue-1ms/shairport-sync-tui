@@ -14,12 +14,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 try:
     import dbus
 except ImportError:  # pragma: no cover - depends on host packages
     dbus = None
-
 
 VERSION = "0.3.0"
 SERVICE = "org.gnome.ShairportSync"
@@ -37,6 +37,7 @@ HISTORY_PATH = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / 
 HISTORY_LIMIT = 12
 LOG_LINES = 80
 USE_COLOR = True
+ARTWORK_IMAGE_CACHE: dict[tuple[str, int, int, int, str], bytes] = {}
 
 DEFAULT_APP_CONFIG = {
     "refresh_interval": DEFAULT_REFRESH_SECONDS,
@@ -230,6 +231,81 @@ def resolve_hostname(address: str) -> str:
     except Exception:
         return ""
     return host.rstrip(".")
+
+
+def art_url_to_path(art_url: str) -> Path | None:
+    if not art_url:
+        return None
+    parsed = urlparse(art_url)
+    if parsed.scheme != "file":
+        return None
+    path = Path(unquote(parsed.path))
+    return path if path.exists() else None
+
+
+def artwork_image_format() -> str | None:
+    if not shutil.which("chafa"):
+        return None
+    term = os.environ.get("TERM", "").lower()
+    term_program = os.environ.get("TERM_PROGRAM", "").lower()
+    if os.environ.get("KITTY_WINDOW_ID") or "kitty" in term:
+        return "kitty"
+    if term_program == "iterm.app":
+        return "iterm"
+    if any(name in term for name in ("foot", "sixel", "xterm", "mlterm", "contour", "wezterm")):
+        return "sixels"
+    return None
+
+
+def render_artwork_image(art_url: str, cols: int, rows: int) -> bytes:
+    image_format = artwork_image_format()
+    if image_format is None or cols <= 0 or rows <= 0:
+        return b""
+    path = art_url_to_path(art_url)
+    if path is None:
+        return b""
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return b""
+    key = (str(path), cols, rows, mtime_ns, image_format)
+    cached = ARTWORK_IMAGE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        completed = subprocess.run(
+            [
+                "chafa",
+                f"--format={image_format}",
+                "--animate=off",
+                "--polite=on",
+                "--passthrough=auto",
+                f"--size={cols}x{rows}",
+                "--scale=max",
+                str(path),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+        )
+    except Exception:
+        return b""
+    if completed.returncode != 0 or not completed.stdout:
+        return b""
+    ARTWORK_IMAGE_CACHE.clear()
+    ARTWORK_IMAGE_CACHE[key] = completed.stdout
+    return completed.stdout
+
+
+def paint_artwork_image(row: int, col: int, payload: bytes) -> None:
+    if not payload:
+        return
+    try:
+        sys.stdout.buffer.write(f"\033[{row + 1};{col + 1}H".encode() + payload)
+        sys.stdout.buffer.flush()
+    except Exception:
+        return
 
 
 def run_cmd(args: list[str], timeout: float = 2.0) -> tuple[bool, str]:
@@ -554,6 +630,41 @@ def draw_bar(win: curses.window, row: int, col: int, width: int, fraction: float
     add_line(win, row, col, "[" + "#" * fill + "-" * (width - fill) + "]")
 
 
+def draw_artwork_panel(
+    stdscr: curses.window,
+    snap: Snapshot,
+    top: int,
+    col: int,
+    panel_width: int,
+    panel_height: int,
+) -> tuple[int, int, bytes] | None:
+    title_attr = pair(1) | curses.A_BOLD
+    muted_attr = curses.A_DIM
+    inner_width = max(8, panel_width)
+    inner_height = max(4, panel_height - 1)
+    image = render_artwork_image(snap.art_url, inner_width, inner_height)
+
+    add_line(stdscr, top, col, "Artwork", title_attr, max_width=panel_width)
+    if image:
+        for idx in range(inner_height):
+            add_line(stdscr, top + 1 + idx, col, " " * inner_width, 0, max_width=panel_width)
+        return (top + 1, col, image)
+
+    if not shutil.which("chafa"):
+        reason = "chafa missing"
+    elif artwork_image_format() is None:
+        reason = "image protocol unavailable"
+    elif art_url_to_path(snap.art_url) is None:
+        reason = "cache file unavailable"
+    else:
+        reason = "image render failed"
+    fallback = [reason, "see Debug for URL"]
+    for idx in range(inner_height):
+        text = fallback[idx] if idx < len(fallback) else ""
+        add_line(stdscr, top + 1 + idx, col, text[:inner_width].ljust(inner_width), muted_attr, max_width=panel_width)
+    return None
+
+
 def draw_header(stdscr: curses.window, message: str) -> None:
     _, width = stdscr.getmaxyx()
     title_attr = pair(1) | curses.A_BOLD
@@ -625,35 +736,44 @@ def draw_main(
     if snap.client_name and width >= 72:
         client_value = f"{client_value} ({snap.client_name})"
 
+    artwork_panel_width = 30 if width >= 104 else 26
+    artwork_col = width - artwork_panel_width
+    show_artwork_panel = width >= 92 and height >= 20 and bool(snap.art_url)
+    content_width = artwork_col - 3 if show_artwork_panel else width - 1
+    artwork_image: tuple[int, int, bytes] | None = None
+
     row = 3
     add_line(stdscr, row, 0, status, status_attr)
-    add_line(stdscr, row, 14, f"{client_label}: {client_value}", muted_attr, max_width=max(12, width - 42))
-    add_line(stdscr, row, max(0, width - 24), f"Vol: {volume}", muted_attr)
+    add_line(stdscr, row, 14, f"{client_label}: {client_value}", muted_attr, max_width=max(12, content_width - 38))
+    add_line(stdscr, row, max(0, content_width - 24), f"Vol: {volume}", muted_attr)
 
     row += 2
-    add_line(stdscr, row, 0, "Now Playing", title_attr)
+    add_line(stdscr, row, 0, "Now Playing", title_attr, max_width=content_width)
     row += 2
-    add_line(stdscr, row, 2, snap.title or "-", curses.A_BOLD)
+    add_line(stdscr, row, 2, snap.title or "-", curses.A_BOLD, max_width=content_width - 2)
     row += 1
-    add_line(stdscr, row, 2, snap.artist or "-", title_attr)
+    add_line(stdscr, row, 2, snap.artist or "-", title_attr, max_width=content_width - 2)
 
     album_line = snap.album or "-"
     if snap.genre and width >= 72:
         album_line = f"{album_line} | {snap.genre}"
     row += 1
-    add_line(stdscr, row, 2, album_line, muted_attr)
-    if snap.art_url and height >= 26:
+    add_line(stdscr, row, 2, album_line, muted_attr, max_width=content_width - 2)
+    if snap.art_url and height >= 26 and not show_artwork_panel:
         row += 1
-        add_line(stdscr, row, 2, f"Artwork: {snap.art_url}", muted_attr)
+        add_line(stdscr, row, 2, f"Artwork: {snap.art_url}", muted_attr, max_width=content_width - 2)
+
+    if show_artwork_panel:
+        artwork_image = draw_artwork_panel(stdscr, snap, 5, artwork_col, artwork_panel_width - 1, min(15, max(8, height - 7)))
 
     estimated = " estimated" if snap.progress_estimated else ""
     row += 2
-    add_line(stdscr, row, 2, f"{format_seconds(snap.elapsed_seconds)} / {format_seconds(snap.duration_seconds)}{estimated}", muted_attr)
+    add_line(stdscr, row, 2, f"{format_seconds(snap.elapsed_seconds)} / {format_seconds(snap.duration_seconds)}{estimated}", muted_attr, max_width=content_width - 2)
     fraction = None
     if snap.elapsed_seconds is not None and snap.duration_seconds:
         fraction = snap.elapsed_seconds / snap.duration_seconds
     row += 1
-    draw_bar(stdscr, row, 2, max(8, width - 5), fraction)
+    draw_bar(stdscr, row, 2, max(8, content_width - 4), fraction)
 
     if height >= 20:
         row += 3
@@ -665,6 +785,8 @@ def draw_main(
 
     draw_footer(stdscr, "main")
     stdscr.refresh()
+    if artwork_image is not None:
+        paint_artwork_image(*artwork_image)
 
 
 def draw_debug(
@@ -980,6 +1102,11 @@ def check_line(label: str, ok: bool, detail: str) -> str:
     return f"{status:4} {label}: {detail}"
 
 
+def check_optional_line(label: str, ok: bool, detail: str) -> str:
+    status = "ok" if ok else "warn"
+    return f"{status:4} {label}: {detail}"
+
+
 def doctor() -> int:
     failures = 0
     print("shairport-tui doctor")
@@ -990,6 +1117,9 @@ def doctor() -> int:
         ok = path is not None
         failures += 0 if ok else 1
         print(check_line(command, ok, path or "not found"))
+    chafa_path = shutil.which("chafa")
+    chafa_detail = chafa_path or "not found; inline artwork disabled"
+    print(check_optional_line("chafa optional", chafa_path is not None, chafa_detail))
 
     print(check_line("python3-dbus", dbus is not None, "importable" if dbus is not None else "not importable"))
     if dbus is None:
