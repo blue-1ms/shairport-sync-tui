@@ -554,18 +554,37 @@ def draw_bar(win: curses.window, row: int, col: int, width: int, fraction: float
     add_line(win, row, col, "[" + "#" * fill + "-" * (width - fill) + "]")
 
 
-def draw_header(stdscr: curses.window, view: str, refresh_seconds: float, message: str) -> None:
+def draw_header(stdscr: curses.window, message: str) -> None:
     _, width = stdscr.getmaxyx()
     title_attr = pair(1) | curses.A_BOLD
     muted_attr = curses.A_DIM
     warn_attr = pair(4) | curses.A_BOLD
     add_line(stdscr, 0, 0, "Shairport Sync", title_attr)
     add_line(stdscr, 0, max(0, width - 22), dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), muted_attr)
-    toggle = "main" if view == "debug" else "debug"
-    add_line(stdscr, 1, 0, f"{view} | SPC play | n/p | +/- | m mute | s stop | d {toggle} | ? help | r | q", muted_attr)
-    add_line(stdscr, 2, 0, "-" * max(0, width - 1), muted_attr)
+    add_line(stdscr, 1, 0, "-" * max(0, width - 1), muted_attr)
     if message:
-        add_line(stdscr, 3, 0, message, warn_attr if message.startswith("error") else muted_attr)
+        add_line(stdscr, 2, 0, message, warn_attr if message.startswith("error") else muted_attr)
+
+
+def draw_footer(stdscr: curses.window, view: str) -> None:
+    height, width = stdscr.getmaxyx()
+    muted_attr = curses.A_DIM
+    if height <= 2:
+        return
+
+    if view == "debug":
+        if width < 72:
+            text = "0-5 Filter  j/k Scroll  d Main  ? Help  q"
+        else:
+            text = "0 All  1 Detail  2 Svc  3 Audio  4 Hist  5 Logs  j/k Scroll  d Main  q Quit"
+    elif view == "help":
+        text = "?/h Back  q Quit"
+    else:
+        if width < 72:
+            text = "Space Play  n/p  +/-  d Debug  ? Help  q"
+        else:
+            text = "Space Play/Pause  n Next  p Prev  +/- Vol  d Debug  ? Help  q Quit"
+    add_line(stdscr, height - 1, 0, text, muted_attr)
 
 
 def draw_main(
@@ -581,62 +600,70 @@ def draw_main(
     good_attr = pair(3) | curses.A_BOLD
     warn_attr = pair(4) | curses.A_BOLD
 
-    draw_header(stdscr, "main", refresh_seconds, message)
+    draw_header(stdscr, message)
 
     if not snap.ok:
-        add_line(stdscr, 5, 0, "Status", warn_attr)
-        add_line(stdscr, 6, 2, snap.error or "Unable to read Shairport Sync.", warn_attr)
-        add_line(stdscr, 8, 2, "Check shairport-sync and system D-Bus access.", muted_attr)
+        add_line(stdscr, 4, 0, "Status", warn_attr)
+        add_line(stdscr, 5, 2, snap.error or "Unable to read Shairport Sync.", warn_attr)
+        add_line(stdscr, 7, 2, "Check shairport-sync and system D-Bus access.", muted_attr)
+        draw_footer(stdscr, "main")
         stdscr.refresh()
         return
 
     connected = snap.available and snap.client
-    status = "connected" if connected else "idle"
+    status = "Connected" if connected else "Idle"
     status_attr = good_attr if connected else muted_attr
 
     volume = "-"
     if snap.airplay_volume is not None:
         volume = f"{snap.airplay_volume:.1f} dB"
-        if snap.volume_percent is not None:
+        if snap.volume_percent is not None and width >= 72:
             volume += f" ({snap.volume_percent:.0f}%)"
 
     client_label = "Client" if connected else "Last client"
     client_value = snap.client or "-"
-    if snap.client_name:
+    if snap.client_name and width >= 72:
         client_value = f"{client_value} ({snap.client_name})"
-    add_line(stdscr, 4, 0, status_badge(status), status_attr)
-    add_line(stdscr, 4, 14, f"{client_label}: {client_value}", muted_attr, max_width=max(12, width - 44))
-    add_line(stdscr, 4, max(0, width - 28), f"Volume: {volume}", muted_attr)
 
-    add_line(stdscr, 6, 0, "Now Playing", title_attr)
-    add_line(stdscr, 8, 2, snap.title or "-", curses.A_BOLD)
-    add_line(stdscr, 9, 2, snap.artist or "-", title_attr)
+    row = 3
+    add_line(stdscr, row, 0, status, status_attr)
+    add_line(stdscr, row, 14, f"{client_label}: {client_value}", muted_attr, max_width=max(12, width - 42))
+    add_line(stdscr, row, max(0, width - 24), f"Vol: {volume}", muted_attr)
+
+    row += 2
+    add_line(stdscr, row, 0, "Now Playing", title_attr)
+    row += 2
+    add_line(stdscr, row, 2, snap.title or "-", curses.A_BOLD)
+    row += 1
+    add_line(stdscr, row, 2, snap.artist or "-", title_attr)
 
     album_line = snap.album or "-"
-    if snap.genre:
+    if snap.genre and width >= 72:
         album_line = f"{album_line} | {snap.genre}"
-    add_line(stdscr, 10, 2, album_line, muted_attr)
-    if snap.art_url:
-        add_line(stdscr, 11, 2, f"Artwork: {snap.art_url}", muted_attr)
+    row += 1
+    add_line(stdscr, row, 2, album_line, muted_attr)
+    if snap.art_url and height >= 26:
+        row += 1
+        add_line(stdscr, row, 2, f"Artwork: {snap.art_url}", muted_attr)
 
     estimated = " estimated" if snap.progress_estimated else ""
-    add_line(stdscr, 12, 2, f"{format_seconds(snap.elapsed_seconds)} / {format_seconds(snap.duration_seconds)}{estimated}", muted_attr)
+    row += 2
+    add_line(stdscr, row, 2, f"{format_seconds(snap.elapsed_seconds)} / {format_seconds(snap.duration_seconds)}{estimated}", muted_attr)
     fraction = None
     if snap.elapsed_seconds is not None and snap.duration_seconds:
         fraction = snap.elapsed_seconds / snap.duration_seconds
-    draw_bar(stdscr, 13, 2, max(8, width - 5), fraction)
+    row += 1
+    draw_bar(stdscr, row, 2, max(8, width - 5), fraction)
 
-    row = 16
-    add_line(stdscr, row, 0, "Playback", title_attr)
-    row += 1
-    add_line(stdscr, row, 2, f"State: {status_badge(snap.player_state)}")
-    row += 1
-    add_line(stdscr, row, 2, f"Session active: {'yes' if snap.active else 'no'}")
-    row += 1
-    add_line(stdscr, row, 2, "Press d for debug: services, audio output, logs, and connection history.", muted_attr)
+    if height >= 20:
+        row += 3
+        add_line(stdscr, row, 0, "Playback", title_attr)
+        row += 1
+        add_line(stdscr, row, 2, f"State: {snap.player_state or '-'}")
+        row += 1
+        add_line(stdscr, row, 2, f"AirPlay session: {'yes' if snap.active else 'no'}")
 
-    if height > 4:
-        add_line(stdscr, height - 1, 0, "Tip: use --doctor outside the TUI for a full environment check.", muted_attr)
+    draw_footer(stdscr, "main")
     stdscr.refresh()
 
 
@@ -657,10 +684,20 @@ def draw_debug(
     good_attr = pair(3) | curses.A_BOLD
     warn_attr = pair(4) | curses.A_BOLD
 
-    draw_header(stdscr, "debug", refresh_seconds, message)
-    add_line(stdscr, 3, max(0, width - 54), f"filter: {section_filter} | 0 all 1 svc 2 audio 3 hist 4 logs", muted_attr)
+    draw_header(stdscr, message)
+    add_line(stdscr, 3, 0, "Debug", title_attr)
+    add_line(stdscr, 3, max(0, width - 18), f"Filter: {section_filter}", muted_attr)
 
     rows: list[tuple[int, Any, int]] = []
+    if section_filter in ("all", "now-playing"):
+        rows.append((0, "Now Playing Details", title_attr))
+        rows.append((2, f"Title: {snap.title or '-'}", 0))
+        rows.append((2, f"Artist: {snap.artist or '-'}", 0))
+        rows.append((2, f"Album: {snap.album or '-'}", 0))
+        rows.append((2, f"Genre: {snap.genre or '-'}", 0))
+        rows.append((2, f"Artwork: {snap.art_url or '-'}", muted_attr))
+        rows.append((0, "", 0))
+
     if section_filter in ("all", "services"):
         rows.append((0, "Service Health", title_attr))
         for unit in system.units:
@@ -713,7 +750,8 @@ def draw_debug(
 
     if height > 4:
         position = f"scroll {scroll}/{max_scroll}" if max_scroll else "scroll 0/0"
-        add_line(stdscr, height - 1, 0, f"{position} | Build: {snap.version or '-'}", muted_attr)
+        add_line(stdscr, height - 2, 0, f"{position} | Build: {snap.version or '-'}", muted_attr)
+    draw_footer(stdscr, "debug")
     stdscr.refresh()
     return max_scroll
 
@@ -722,7 +760,8 @@ def draw_help(stdscr: curses.window, refresh_seconds: float, message: str) -> No
     stdscr.erase()
     title_attr = pair(1) | curses.A_BOLD
     muted_attr = curses.A_DIM
-    draw_header(stdscr, "help", refresh_seconds, message)
+    draw_header(stdscr, message)
+    add_line(stdscr, 3, 0, "Help", title_attr)
     lines = [
         ("Keys", title_attr),
         ("  Space       Play or pause", 0),
@@ -731,7 +770,7 @@ def draw_help(stdscr: curses.window, refresh_seconds: float, message: str) -> No
         ("  m           Toggle mute", 0),
         ("  s           Stop playback", 0),
         ("  d           Toggle main/debug view", 0),
-        ("  0-4         Debug filters: all/services/audio/history/logs", 0),
+        ("  0-5         Debug filters: all/details/services/audio/history/logs", 0),
         ("  r           Refresh now", 0),
         ("  j/k, arrows Scroll debug view", 0),
         ("  C           Clear connection history, with confirmation", 0),
@@ -746,8 +785,12 @@ def draw_help(stdscr: curses.window, refresh_seconds: float, message: str) -> No
         ("", 0),
         ("Press ? or h to return.", muted_attr),
     ]
+    height, _width = stdscr.getmaxyx()
     for row, (text, attr) in enumerate(lines, start=5):
+        if row >= height - 1:
+            break
         add_line(stdscr, row, 0, text, attr)
+    draw_footer(stdscr, "help")
     stdscr.refresh()
 
 
@@ -887,10 +930,11 @@ def run(stdscr: curses.window, refresh_seconds: float, default_view: str) -> Non
         if view == "debug":
             filters = {
                 ord("0"): "all",
-                ord("1"): "services",
-                ord("2"): "audio",
-                ord("3"): "history",
-                ord("4"): "logs",
+                ord("1"): "now-playing",
+                ord("2"): "services",
+                ord("3"): "audio",
+                ord("4"): "history",
+                ord("5"): "logs",
             }
             if key in filters:
                 debug_filter = filters[key]

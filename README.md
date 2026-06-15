@@ -30,7 +30,7 @@ Sync's D-Bus remote-control interface.
 - In-app help overlay with `?`.
 - Debug filters for services, audio, history, and logs.
 - Client hostname lookup when the OS can resolve the AirPlay source address.
-- Artwork path hints when Shairport Sync exposes cover art.
+- Artwork path hints in debug when Shairport Sync exposes cover art.
 - Config file support at `~/.config/shairport-tui/config.json`.
 - `--doctor` diagnostics for dependencies, services, D-Bus, logs, and audio.
 - `--clear-history` for deleting saved connection history.
@@ -144,10 +144,11 @@ shairport-tui --config ./config.json
 | `r` | Refresh now |
 | `d` | Toggle debug view |
 | `0` | Show all debug sections |
-| `1` | Show service health only |
-| `2` | Show audio output only |
-| `3` | Show connection history only |
-| `4` | Show recent logs only |
+| `1` | Show now-playing details only |
+| `2` | Show service health only |
+| `3` | Show audio output only |
+| `4` | Show connection history only |
+| `5` | Show recent logs only |
 | `?` or `h` | Toggle help |
 | `j` / `k` or arrows | Scroll debug view |
 | `f` / `b` or Page Down / Page Up | Page debug view |
@@ -164,7 +165,7 @@ Press `d` to open the debug screen. Debug contains the noisier operational
 details: systemd health, audio output configuration, ALSA/Pulse state,
 connection history, and recent Shairport Sync logs.
 
-Use `0` through `4` in debug to filter the debug sections.
+Use `0` through `5` in debug to filter the debug sections.
 
 ## Configuration
 
